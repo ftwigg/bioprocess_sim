@@ -1,6 +1,8 @@
 # kinetics.py
 """
 Growth kinetics and substrate consumption based on Pirt model.
+Does not include the Luedeking-Piret model extension for inclusion of high product formation rates.
+Specific growth rate uses the Monod model for determining mu at any given [S] and assumes constant Ks and mu_max. Commented out Haldane extension for inhibition models.
 Handles specific growth rates, substrate utilization, and product formation.
 """
 
