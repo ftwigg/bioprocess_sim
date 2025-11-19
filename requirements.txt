@@ -1,0 +1,22 @@
+# Batch Reactor Simulation - Requirements
+# Compatible with Google Colab and local installations
+
+# Core numerical computing
+numpy>=1.20.0
+
+# Scientific computing and optimization
+scipy>=1.7.0
+
+# Plotting and visualization
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+# Data manipulation and export
+pandas>=1.3.0
+
+# Optional: for Excel export support
+openpyxl>=3.0.0
+
+# Note: IPython is pre-installed in Google Colab
+# If running locally in Jupyter, install with:
+# jupyter>=1.0.0
