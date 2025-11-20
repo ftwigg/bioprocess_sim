@@ -9,6 +9,7 @@ Commented out potential Haldane extension for inhibition models.
 Product formation rate is based on 4 options: growth, non-growth, mixed, or no product (qp=0)
 
 Oxygen consumption: this module hard-codes a maintenance-related oxygen consumption assumption based on glucose oxidation.
+RQ is currently a fixed parameter passed in. CER therefore is determined by calculation of OUR and provision of RQ.
 
 Handles specific growth rates, substrate utilization, and product formation.
 """
