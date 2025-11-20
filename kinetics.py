@@ -2,7 +2,14 @@
 """
 Growth kinetics and substrate consumption based on Pirt model.
 Does not include the Luedeking-Piret model extension for inclusion of high product formation rates.
-Specific growth rate uses the Monod model for determining mu at any given [S] and assumes constant Ks and mu_max. Commented out Haldane extension for inhibition models.
+
+Specific growth rate uses the Monod model for determining mu at any given [S] and assumes constant Ks and mu_max.
+Commented out potential Haldane extension for inhibition models.
+
+Product formation rate is based on 4 options: growth, non-growth, mixed, or no product (qp=0)
+
+Oxygen consumption: this module hard-codes a maintenance-related oxygen consumption assumption based on glucose oxidation.
+
 Handles specific growth rates, substrate utilization, and product formation.
 """
 
@@ -231,7 +238,7 @@ class SubstrateBalance:
         """
         return self.params.ms * X
     
-    def total_substrate_consumption(self, dX_dt: float, dP_dt: float, X: float) -> float:
+    def total_substrate_consumption(self, : float, dP_dt: float, X: float) -> float:
         """
         Total substrate consumption rate.
         
