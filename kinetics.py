@@ -239,7 +239,7 @@ class SubstrateBalance:
         """
         return self.params.ms * X
     
-    def total_substrate_consumption(self, : float, dP_dt: float, X: float) -> float:
+    def total_substrate_consumption(self, dX_dt: float, dP_dt: float, X: float) -> float:
         """
         Total substrate consumption rate.
         
