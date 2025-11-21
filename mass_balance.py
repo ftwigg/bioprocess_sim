@@ -24,7 +24,7 @@ class LiquidPhaseMassBalance:
     
     def biomass_balance(self, dX_dt: float) -> float:
         """
-        Biomass balance: dX/dt = μ * X
+        Biomass balance: dX/dt = Î¼ * X
         
         Args:
             dX_dt: Biomass growth rate from kinetics (g/L/h)
@@ -90,7 +90,7 @@ class GasPhaseMassBalance:
     - Mass transfer between gas and liquid phases
     """
     
-    # Henry's constants at 37°C (mol/L/atm)
+    # Henry's constants at 37Â°C (mol/L/atm)
     # These are approximate and temperature-dependent
     H_O2 = 0.0013  # mol/L/atm
     H_CO2 = 0.034  # mol/L/atm
@@ -115,14 +115,14 @@ class GasPhaseMassBalance:
         Args:
             partial_pressure: Partial pressure of gas (atm)
             henry_const: Henry's constant (mol/L/atm) at reference T
-            T: Temperature (°C)
+            T: Temperature (Â°C)
             
         Returns:
             Saturation concentration (mmol/L)
         """
         # Temperature correction (van't Hoff equation)
-        # Simplified: H(T) ≈ H(T_ref) * exp[-ΔH/R * (1/T - 1/T_ref)]
-        # For simplicity, using H at 37°C directly
+        # Simplified: H(T) â‰ˆ H(T_ref) * exp[-Î”H/R * (1/T - 1/T_ref)]
+        # For simplicity, using H at 37Â°C directly
         
         C_sat = henry_const * partial_pressure * 1000  # Convert to mmol/L
         return C_sat
@@ -136,7 +136,7 @@ class GasPhaseMassBalance:
         Args:
             C_L: Dissolved oxygen concentration (mmol/L)
             P_O2: Oxygen partial pressure in gas phase (atm)
-            T: Temperature (°C)
+            T: Temperature (Â°C)
             
         Returns:
             Oxygen transfer rate (mmol/L/h)
@@ -154,7 +154,7 @@ class GasPhaseMassBalance:
         Args:
             C_L: Dissolved CO2 concentration (mmol/L)
             P_CO2: CO2 partial pressure in gas phase (atm)
-            T: Temperature (°C)
+            T: Temperature (Â°C)
             
         Returns:
             CO2 transfer rate (mmol/L/h) - positive means leaving liquid
@@ -215,7 +215,7 @@ class GasPhaseMassBalance:
         # Inlet molar flow rates
         P_total = 1.0  # atm
         T_gas = 37.0 + 273.15  # K
-        R = 0.08206  # L·atm/(mol·K)
+        R = 0.08206  # LÂ·atm/(molÂ·K)
         
         # Total inlet molar flow (mol/h)
         n_in_total = (P_total * self.Q_gas) / (R * T_gas)
