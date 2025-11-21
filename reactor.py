@@ -29,9 +29,9 @@ class BatchReactor:
     - pH and chemical equilibria
     
     Main equation system:
-    dX/dt = μ * X
-    dS/dt = -(μ/Yx_s + ms) * X
-    dP/dt = (α*μ + β) * X
+    dX/dt = Î¼ * X
+    dS/dt = -(Î¼/Yx_s + ms) * X
+    dP/dt = (Î±*Î¼ + Î²) * X
     dCO2/dt = OTR - OUR
     pH = f(metabolites, buffers)
     T = f(Q_gen, Q_removed)
@@ -144,6 +144,57 @@ class BatchReactor:
         dP_dt = rates['dP_dt']
         OUR = rates['OUR']
         CER = rates['CER']
+        
+        # =====================================================================
+        # SUBSTRATE DEPLETION SAFEGUARD
+        # =====================================================================
+        # The Pirt model calculates maintenance consumption (ms * X) regardless
+        # of substrate availability. When S → 0, this creates a non-physical
+        # situation where dS/dt remains negative, driving S below zero.
+        #
+        # This clamp prevents negative substrate by limiting consumption to
+        # what's actually available. However, this is a NUMERICAL SAFEGUARD,
+        # not a complete biological model of starvation.
+        #
+        # BIOLOGICAL REALITY (not modeled here):
+        # When substrate is exhausted and maintenance cannot be met, cells may:
+        #
+        # 1. ENDOGENOUS METABOLISM: Cells consume internal reserves (glycogen,
+        #    PHB, lipids, etc.) to meet maintenance. This would cause gradual
+        #    biomass decline: dX/dt = -k_end * X
+        #
+        # 2. CELL DEATH/LYSIS: Without energy, cells lose viability and lyse.
+        #    This releases intracellular contents, potentially enabling
+        #    "cryptic growth" of surviving cells on lysate.
+        #    Typical death rates: kd = 0.01-0.05 h⁻¹
+        #
+        # 3. DORMANCY: Some organisms enter a low-energy stationary state,
+        #    dramatically reducing maintenance requirements. Spore-formers
+        #    (Bacillus, Clostridium) are extreme examples.
+        #
+        # 4. MAINTENANCE ADAPTATION: Some evidence suggests ms itself decreases
+        #    during prolonged starvation as cells down-regulate metabolism.
+        #
+        # For accurate post-depletion dynamics, implement one of:
+        #   - Biomass decay term: dX/dt = μ*X - kd*X*(1 - S/(Ks_death + S))
+        #   - Endogenous metabolism: dX/dt = μ*X - k_end*X when S < threshold
+        #   - Viability model: track viable vs. non-viable cell fractions
+        #
+        # For now, we simply prevent negative substrate. Results after
+        # substrate depletion should be interpreted with caution.
+        # =====================================================================
+        
+        # Clamp: don't consume substrate faster than it can be depleted
+        # Use a small threshold to avoid numerical issues near zero
+        S_MIN_THRESHOLD = 1e-6  # g/L
+        if S < S_MIN_THRESHOLD:
+            # Substrate essentially gone - stop all consumption
+            dS_dt = 0.0
+        else:
+            # Limit consumption rate so S doesn't go negative in one step
+            # Max rate = consume all S in ~0.01 hours (numerical buffer)
+            max_depletion_rate = S / 0.01
+            dS_dt = max(dS_dt, -max_depletion_rate)
         
         # Gas transfer
         # Assume inlet gas composition for partial pressures
@@ -320,10 +371,10 @@ class BatchReactor:
         
         print(f"\nEnvironmental:")
         print(f"  pH:             {summary['pH']:.2f}")
-        print(f"  Temperature:    {summary['temperature']:.1f} °C")
+        print(f"  Temperature:    {summary['temperature']:.1f} Â°C")
         
         print(f"\nKinetics:")
-        print(f"  Growth rate (μ): {summary['growth_rate']:.4f} 1/h")
+        print(f"  Growth rate (Î¼): {summary['growth_rate']:.4f} 1/h")
         print(f"  OUR:            {summary['OUR']:.2f} mmol/L/h")
         print(f"  CER:            {summary['CER']:.2f} mmol/L/h")
         
@@ -365,7 +416,7 @@ def create_example_reactor() -> BatchReactor:
         V_working=1.5,  # L
         kLa_O2=100.0,  # 1/h
         kLa_CO2=80.0,  # 1/h
-        T_set=37.0,  # °C
+        T_set=37.0,  # Â°C
         X0=0.1,  # g/L
         S0=20.0,  # g/L
         P0=0.0,  # g/L
