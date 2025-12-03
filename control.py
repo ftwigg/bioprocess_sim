@@ -74,13 +74,25 @@ class SimplifiedCascade(DOControlStrategy):
         H_O2 = HenryConstant.get_H_O2(state.T)
         C_star = H_O2 * P_O2 * 1000  # mmol/L
         
-        # Required kLa to maintain DO setpoint
-        # OTR = kLa × (C* - DO_sp) = OUR
-        if C_star > self.DO_sp and OUR > 0:
-            kLa_req = OUR / (C_star - self.DO_sp)
+        # Required kLa based on CURRENT DO (feedback control)
+        # At steady state: OTR = kLa × (C* - DO_current) = OUR
+        # This gives the kLa needed to balance current OUR at current DO
+        if C_star > DO and OUR > 0:
+            kLa_base = OUR / (C_star - DO)
         else:
-            # Cannot maintain DO (too low driving force)
-            kLa_req = 1000.0  # Very high
+            # Cannot maintain DO (too low driving force or no consumption)
+            kLa_base = 100.0  # High value
+        
+        # Add proportional feedback to drive DO toward setpoint
+        # If DO < setpoint, increase kLa; if DO > setpoint, decrease kLa
+        error = self.DO_sp - DO  # Positive when DO is low
+        K_p = 20.0  # Proportional gain (tuning parameter)
+        
+        # Feedback correction (percentage adjustment)
+        feedback_correction = 1.0 + K_p * error / max(self.DO_sp, 0.01)
+        feedback_correction = max(0.5, min(feedback_correction, 2.0))  # Limit to ±100%
+        
+        kLa_req = kLa_base * feedback_correction
         
         # Extract correlation parameters
         k = self.kLa_model.k_O2
