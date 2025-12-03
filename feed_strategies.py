@@ -106,14 +106,17 @@ class DOStatFeed(FeedStrategy):
     """
     DO-stat feed: Adjust feed rate to maintain DO setpoint.
     
-    Uses proportional control:
-    F = F_base + K_p × (DO - DO_setpoint)
+    Uses PI control:
+    F = F_base + K_p × (DO - DO_setpoint) + K_i × integral(error)
+    
+    Set K_i = 0 for proportional-only control.
     """
     
     def __init__(self,
                  feed_composition: FeedComposition,
                  DO_setpoint: float,
                  K_p: float,
+                 K_i: float = 0.0,
                  F_min: float = 0.0,
                  F_max: float = 1.0):
         """
@@ -121,20 +124,50 @@ class DOStatFeed(FeedStrategy):
             feed_composition: Feed composition
             DO_setpoint: Target DO (mmol/L)
             K_p: Proportional gain (L/h per mmol/L)
+            K_i: Integral gain (L/h per mmol/L per hour)
             F_min: Minimum feed rate (L/h)
             F_max: Maximum feed rate (L/h)
         """
         super().__init__(feed_composition)
         self.DO_setpoint = DO_setpoint
         self.K_p = K_p
+        self.K_i = K_i
         self.F_min = F_min
         self.F_max = F_max
         self.F_base = (F_min + F_max) / 2  # Start at midpoint
+        
+        # Integral state
+        self.integral = 0.0
+        self.last_t = None
+        self.last_error = 0.0
     
     def get_feed_rate(self, t: float, state: ReactorState) -> float:
+        # Calculate error
         error = state.DO - self.DO_setpoint
-        F = self.F_base + self.K_p * error
+        
+        # Update integral (trapezoidal rule)
+        if self.last_t is not None and self.K_i != 0.0:
+            dt = t - self.last_t
+            if dt > 0:
+                # Trapezoidal integration
+                self.integral += 0.5 * (error + self.last_error) * dt
+                
+                # Anti-windup: Reset integral if saturated
+                F_test = self.F_base + self.K_p * error + self.K_i * self.integral
+                if F_test > self.F_max or F_test < self.F_min:
+                    # Don't accumulate integral when saturated
+                    self.integral -= 0.5 * (error + self.last_error) * dt
+        
+        # PI control
+        F = self.F_base + self.K_p * error + self.K_i * self.integral
+        
+        # Saturate
         F = max(self.F_min, min(F, self.F_max))
+        
+        # Update state for next call
+        self.last_t = t
+        self.last_error = error
+        
         return F
 
 
