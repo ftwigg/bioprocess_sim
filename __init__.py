@@ -37,6 +37,8 @@ from .stoichiometry import (
     validate_elemental_balance,
 )
 
+from .balances import check_balances, format_balances
+
 __all__ = [
     # Data models
     'CarbonSource',
@@ -66,4 +68,7 @@ __all__ = [
     'calculate_stoichiometric_coefficients',
     'calculate_RQ',
     'validate_elemental_balance',
+    # Conservation checks
+    'check_balances',
+    'format_balances',
 ]
