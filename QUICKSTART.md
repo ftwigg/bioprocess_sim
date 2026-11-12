@@ -19,8 +19,9 @@ pip install -r requirements.txt
 ```python
 from fedbatch_simulator import *
 from fedbatch_simulator.kinetics import CellParameters
-from fedbatch_simulator.feed_strategies import ExponentialFeed
-from fedbatch_simulator.control import SimplifiedCascade
+from fedbatch_simulator.feed_strategies import ConstantFeed, ExponentialFeed, PiecewiseFeed
+from fedbatch_simulator.control import PICascade
+from fedbatch_simulator.mass_transfer import DynamicKLa
 from fedbatch_simulator.reactor import FedBatchReactor
 from fedbatch_simulator.simulator import FedBatchSimulator
 ```
@@ -74,19 +75,33 @@ feed_comp = FeedComposition(
     temperature=25.0
 )
 
-# Exponential feeding
-feed_strategy = ExponentialFeed(
+# Batch first, then exponential feeding. The 10 g/L of batch glucose runs out
+# at about 5.3 h and leaves about 5.3 g/L of biomass.
+mu_set = 0.12  # Target growth rate (1/h)
+F0 = ExponentialFeed.initial_rate(   # what that biomass needs to grow at mu_set
+    mu_set=mu_set, X=5.3, V=2.0, S_feed=500.0, Y_xs=0.5, ms=0.03)
+
+exp_feed = ExponentialFeed(
     feed_composition=feed_comp,
-    F0=0.01,      # Initial rate (L/h)
-    mu_set=0.2,   # Target growth rate (1/h)
-    F_max=0.5     # Maximum rate (L/h)
+    F0=F0,                 # Initial rate (L/h)
+    mu_set=mu_set,
+    F_max=4.5 / 500.0      # Cap (L/h): 4.5 g glucose/h is what the oxygen supply covers
 )
+exp_feed.t_start = 5.5
+
+feed_strategy = PiecewiseFeed([
+    (0.0, ConstantFeed(feed_comp, F_constant=0.0)),
+    (5.5, exp_feed)
+])
 ```
+
+Size the feed from oxygen, not from the pump: feeding faster than the reactor's
+oxygen transfer can burn only accumulates glucose and drives DO to zero.
 
 ### 5. Set up DO control
 
 ```python
-do_control = SimplifiedCascade(
+do_control = PICascade(
     DO_setpoint=0.06,  # Target DO (mmol/L)
     N_min=200,         # Min agitation (rpm)
     N_max=1000,        # Max agitation (rpm)
@@ -110,7 +125,7 @@ reactor = FedBatchReactor(
 
 # Run simulation
 simulator = FedBatchSimulator(reactor)
-results = simulator.simulate(t_end=30.0)
+results = simulator.simulate(t_end=22.0)
 
 # View results
 print(results.get_summary())
@@ -121,8 +136,9 @@ print(results.get_summary())
 ```python
 from fedbatch_simulator import *
 from fedbatch_simulator.kinetics import CellParameters
-from fedbatch_simulator.feed_strategies import ExponentialFeed
-from fedbatch_simulator.control import SimplifiedCascade
+from fedbatch_simulator.feed_strategies import ConstantFeed, ExponentialFeed, PiecewiseFeed
+from fedbatch_simulator.control import PICascade
+from fedbatch_simulator.mass_transfer import DynamicKLa
 from fedbatch_simulator.reactor import FedBatchReactor
 from fedbatch_simulator.simulator import FedBatchSimulator
 
@@ -139,22 +155,27 @@ cell_params = CellParameters(
 initial_state = ReactorState(X=0.5, S_carbon=10.0, S_nitrogen=2.0, 
                              V=2.0, T=37.0, DO=0.2, N=300)
 
-# Feed
-feed_strategy = ExponentialFeed(
-    FeedComposition(S_carbon=500.0, S_nitrogen=50.0, temperature=25.0),
-    F0=0.01, mu_set=0.2, F_max=0.5
+# Feed: batch until the glucose runs out (~5.3 h), then exponential, capped by oxygen
+feed_comp = FeedComposition(S_carbon=500.0, S_nitrogen=50.0, temperature=25.0)
+exp_feed = ExponentialFeed(
+    feed_comp,
+    F0=ExponentialFeed.initial_rate(mu_set=0.12, X=5.3, V=2.0, S_feed=500.0, Y_xs=0.5, ms=0.03),
+    mu_set=0.12, F_max=4.5 / 500.0
 )
+exp_feed.t_start = 5.5
+feed_strategy = PiecewiseFeed([(0.0, ConstantFeed(feed_comp, 0.0)), (5.5, exp_feed)])
 
 # DO control
-do_control = SimplifiedCascade(DO_setpoint=0.06, N_min=200, N_max=1000,
+do_control = PICascade(DO_setpoint=0.06, N_min=200, N_max=1000,
                                Q_gas_min=60, Q_gas_max=240,
                                kLa_correlation=DynamicKLa())
 
 # Run
 reactor = FedBatchReactor(cell_params, LAB_STR_5L, initial_state, 
                           feed_strategy, do_control)
-results = FedBatchSimulator(reactor).simulate(t_end=30.0)
+results = FedBatchSimulator(reactor).simulate(t_end=22.0)
 print(results.get_summary())
+print(format_balances(check_balances(results, cell_params, feed_strategy)))
 ```
 
 ## Examples
@@ -229,14 +250,23 @@ reactor = FedBatchReactor(
 ```python
 from fedbatch_simulator.feed_strategies import DOStatFeed
 
+from fedbatch_simulator.control import FixedAerationAgitation
+
 feed_strategy = DOStatFeed(
     feed_composition=feed_comp,
     DO_setpoint=0.06,
-    K_p=-2.0,      # Negative: high DO → increase feed
+    K_p=0.1,       # Positive: high DO → increase feed
+    K_i=1.0,
     F_min=0.0,
-    F_max=0.3
+    F_max=0.03,
+    F_base=0.0
 )
+
+# Hold the oxygen supply fixed so the feed is the only thing controlling DO
+do_control = FixedAerationAgitation(N=1000, Q_gas=240, kLa_correlation=DynamicKLa())
 ```
+
+See `examples/do_stat_fedbatch.py` for the batch phase that precedes it.
 
 ## Accessing Results
 

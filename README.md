@@ -5,13 +5,14 @@ A first-principles simulator for fed-batch fermentation processes built from eng
 ## Features
 
 ### Core Capabilities
-- **9 coupled ODEs** for complete fed-batch dynamics
+- **12 coupled ODEs** for complete fed-batch dynamics (9 process states, 3 controller integrals)
 - **Multiple substrate limitation** (carbon, nitrogen, oxygen)
 - **Generic carbon sources** (glucose, glycerol, acetate, methanol, or custom)
 - **Elemental balance** for automatic yield calculation
 - **Dynamic kLa** with biomass correction
-- **DO cascade control** (agitation → aeration)
-- **Temperature control** (PID)
+- **DO cascade control** (PI, agitation → aeration) with real controller dynamics
+- **Temperature control** (PI)
+- **Conservation checks** (carbon and electron closure for any run)
 - **Feed strategies** (constant, exponential, DO-stat, piecewise)
 - **pH modeling** (simplified empirical, extensible to mechanistic)
 
@@ -24,9 +25,9 @@ A first-principles simulator for fed-batch fermentation processes built from eng
 
 **Kinetics:**
 - Multiple substrate Monod (or Haldane with inhibition)
-- Pirt maintenance model
+- Uptake-driven Pirt model: substrate uptake is the driver, growth is what is left after maintenance, and starvation gives endogenous decay instead of negative substrate
 - Luedeking-Piret product formation
-- Stoichiometric OUR and CER
+- OUR and CER from the electron and carbon balances, so both close at every instant
 
 **Mass Transfer:**
 - Temperature-dependent Henry's constants
@@ -42,10 +43,12 @@ A first-principles simulator for fed-batch fermentation processes built from eng
 - PID temperature control
 
 **Control:**
-- DO cascade: Try agitation first, then aeration
+- DO cascade: PI with split range, agitation first, then aeration
+- Fixed agitation and aeration for DO-stat feeding
 - Detects oxygen limitation
-- Temperature PID with anti-windup
+- Temperature PI with anti-windup
 - Multiple feed strategies
+- Controller integrals are ODE states, so the model is a pure function of (t, y)
 
 ## Installation
 
@@ -71,10 +74,10 @@ from fedbatch_simulator.simulator import FedBatchSimulator
 
 ## State Vector
 
-The simulator solves 9 coupled ODEs:
+The simulator solves 12 coupled ODEs:
 
 ```
-y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N]
+y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
 ```
 
 Where:
@@ -87,6 +90,21 @@ Where:
 - `V`: Reactor volume (L)
 - `T`: Temperature (°C)
 - `N`: Agitation speed (rpm)
+- `I_DO`, `I_T`, `I_F`: Integral states of the DO, temperature and feed controllers
+
+## Kinetics
+
+```
+q_S  = q_S,max × f_C × f_N × f_O2          q_S,max = μ_max/Y_xs + m_S
+μ    = Y_xs × (q_S − m_S × f_O2)           negative when starved (down to −Y_xs × m_S)
+q_O2  = (γ_S × q_S − γ_X × μ) / 4          on a C-mol basis
+q_CO2 =  q_S − μ                           on a C-mol basis
+```
+
+`f` are Monod (or Haldane) terms. Because uptake carries the Monod term, consumption
+vanishes as the substrate runs out and no balance can go negative. `Y_x/O2`, `m_O2`
+and `RQ` are derived from these balances and reported on `CellParameters`; they are
+no longer free inputs.
 
 ## Mass Balances
 
@@ -103,14 +121,17 @@ Where:
 **Specific balances:**
 ```
 dX/dt = μ × X - D × X
-dS/dt = D × (S_in - S) - (μ/Y_xs + ms) × X
-dP/dt = (α×μ + β) × X - D × P
+dS/dt = D × (S_in - S) - q_S × X
+dP/dt = (α×max(μ,0) + β) × X - D × P
 dDO/dt = OTR - OUR - D × DO
 dDCO2/dt = CER - CTR - D × DCO2
 dV/dt = F_in
 dT/dt = Q_net / (ρ × V × Cp)
 dN/dt = (N_target - N) / τ_N
 ```
+
+After a run, `check_balances(results, cell_params, feed_strategy)` reports how much of
+the carbon and of the available electrons is accounted for.
 
 ## Examples
 
@@ -141,14 +162,17 @@ initial_state = ReactorState(
     X=0.5, S_carbon=10.0, V=2.0, T=37.0, N=300
 )
 
-# Feed strategy: Batch → Exponential
+# Feed strategy: Batch → Exponential, sized from the biomass the batch leaves
+# (about 5.3 g/L at 5.3 h) and capped at what the oxygen supply can burn
 feed_comp = FeedComposition(S_carbon=500.0, temperature=25.0)
 batch_feed = ConstantFeed(feed_comp, F_constant=0.0)
-exp_feed = ExponentialFeed(feed_comp, F0=0.01, mu_set=0.2, F_max=0.5)
-feed_strategy = PiecewiseFeed([(0.0, batch_feed), (10.0, exp_feed)])
+F0 = ExponentialFeed.initial_rate(mu_set=0.12, X=5.3, V=2.0, S_feed=500.0, Y_xs=0.5, ms=0.03)
+exp_feed = ExponentialFeed(feed_comp, F0=F0, mu_set=0.12, F_max=4.5 / 500.0)
+exp_feed.t_start = 5.5
+feed_strategy = PiecewiseFeed([(0.0, batch_feed), (5.5, exp_feed)])
 
 # DO cascade control
-do_control = SimplifiedCascade(
+do_control = PICascade(
     DO_setpoint=0.06,
     N_min=200, N_max=1000,
     Q_gas_min=60, Q_gas_max=240,
@@ -165,10 +189,13 @@ reactor = FedBatchReactor(
 )
 
 simulator = FedBatchSimulator(reactor)
-results = simulator.simulate(t_end=30.0)
+results = simulator.simulate(t_end=22.0)
 
 print(results.get_summary())
+print(format_balances(check_balances(results, cell_params, feed_strategy)))
 ```
+
+See `examples/exponential_fedbatch.py` for the full version with imports.
 
 ### Example 2: Custom Carbon Source
 
