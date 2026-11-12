@@ -1,428 +1,398 @@
-# reactor.py
 """
-Main batch reactor class that integrates all components.
-Provides high-level interface for simulation.
+Fed-batch bioreactor simulator - main reactor class.
+
+Integrates all subsystems:
+- Growth kinetics
+- Mass balances
+- Mass transfer
+- Heat balance
+- Feed control
+- DO cascade control
+- pH modeling
 """
 
 import numpy as np
-from typing import Dict, Optional, Callable
+from typing import Optional, Dict
 from dataclasses import replace
 
-from base_models import (
-    CellParameters, ReactorConfig, ReactorState, 
-    ProductionModel, GasComposition
+from .base_models import (
+    ReactorConfiguration,
+    ReactorState,
+    GasComposition,
+    GasPhaseConditions,
+    ThermodynamicProperties,
+    HeatTransferConfig,
 )
-from kinetics import PirtKinetics, calculate_all_rates
-from mass_balance import LiquidPhaseMassBalance, GasPhaseMassBalance
-from thermodynamics import MetabolicHeat, HeatBalance
-from chemistry import pHCalculator, BufferSystem
+from .kinetics import GrowthKinetics, CellParameters
+from .mass_transfer import MassTransferModel, DynamicKLa
+from .thermodynamics import HeatBalance, TemperatureController
+from .feed_strategies import FeedStrategy
+from .control import DOControlStrategy
+from .chemistry import pHModel, SimplifiedpHModel
 
 
-class BatchReactor:
+class FedBatchReactor:
     """
-    Batch reactor for microbial fermentation.
+    Fed-batch bioreactor simulator.
     
     Integrates:
-    - Cell kinetics (Pirt model)
-    - Mass balances (liquid and gas phases)
-    - Heat generation and removal
-    - pH and chemical equilibria
+    - Multiple substrate kinetics (carbon, nitrogen, oxygen)
+    - Fed-batch mass balances with dilution
+    - Dynamic kLa and DO cascade control
+    - Heat generation and temperature control
+    - pH modeling (simplified)
     
-    Main equation system:
-    dX/dt = Î¼ * X
-    dS/dt = -(Î¼/Yx_s + ms) * X
-    dP/dt = (Î±*Î¼ + Î²) * X
-    dCO2/dt = OTR - OUR
-    pH = f(metabolites, buffers)
-    T = f(Q_gen, Q_removed)
+    State vector (12 ODEs):
+    y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
+    
+    The last three are the integral states of the DO, temperature and feed
+    controllers. Keeping them in the state vector makes the right-hand side
+    a pure function of (t, y): the solver may evaluate it in any order, any
+    number of times, and get the same answer.
     """
     
-    def __init__(self, 
+    STATE_NAMES = ['X', 'S_carbon', 'S_nitrogen', 'P', 'DO', 'DCO2',
+                   'V', 'T', 'N', 'I_DO', 'I_T', 'I_F']
+    
+    def __init__(self,
                  cell_params: CellParameters,
-                 config: ReactorConfig,
-                 initial_state: Optional[ReactorState] = None):
+                 reactor_config: ReactorConfiguration,
+                 initial_state: ReactorState,
+                 feed_strategy: FeedStrategy,
+                 do_control: DOControlStrategy,
+                 temp_controller: Optional[TemperatureController] = None,
+                 mass_transfer_model: Optional[MassTransferModel] = None,
+                 pH_model: Optional[pHModel] = None):
         """
-        Initialize batch reactor.
+        Initialize fed-batch reactor.
         
         Args:
             cell_params: Cellular kinetic parameters
-            config: Reactor configuration
-            initial_state: Initial reactor state (uses defaults if None)
+            reactor_config: Reactor configuration
+            initial_state: Initial reactor state
+            feed_strategy: Feed control strategy
+            do_control: DO control strategy
+            temp_controller: Temperature controller (None for fixed jacket temp)
+            mass_transfer_model: Mass transfer model (None for default dynamic kLa)
+            pH_model: pH model (None for default simplified model)
         """
+        # Store configuration
         self.cell_params = cell_params
-        self.config = config
-        
-        # Initialize state
-        if initial_state is None:
-            self.state = ReactorState(
-                X=config.X0,
-                S=config.S0,
-                P=config.P0,
-                pH=config.pH0,
-                V=config.V_working,
-                T=config.T_set
-            )
-        else:
-            self.state = initial_state
+        self.config = reactor_config
+        # Work on a copy so the caller's initial_state is left as given
+        self.state = replace(initial_state)
+        self.feed_strategy = feed_strategy
+        self.do_control = do_control
+        self.temp_controller = temp_controller
         
         # Initialize subsystems
-        self.kinetics = PirtKinetics(cell_params)
-        self.liquid_balance = LiquidPhaseMassBalance(config)
-        self.gas_balance = GasPhaseMassBalance(config)
-        self.heat_gen = MetabolicHeat('glucose')  # Can parameterize
-        self.heat_balance = HeatBalance(config.V_working, config.cooling_capacity)
-        self.ph_calc = pHCalculator(buffer_capacity=0.05)
-        self.buffer = BufferSystem('phosphate', concentration=0.05)
+        self.kinetics = GrowthKinetics(cell_params)
         
-        # History for tracking
-        self.history: Dict[str, list] = {
-            'time': [],
-            'X': [],
-            'S': [],
-            'P': [],
-            'pH': [],
-            'mu': [],
-            'OUR': [],
-            'CER': [],
-            'Q_gen': [],
-            'T': []
-        }
-    
-    def update_state(self, t: float, y: np.ndarray):
-        """
-        Update reactor state from ODE solution vector.
-        
-        Args:
-            t: Current time (h)
-            y: State vector [X, S, P, dissolved_O2, dissolved_CO2, T]
-        """
-        self.state.time = t
-        self.state.X = max(0, y[0])  # Biomass
-        self.state.S = max(0, y[1])  # Substrate
-        self.state.P = max(0, y[2])  # Product
-        self.state.dissolved_O2 = max(0, y[3])  # Dissolved O2
-        self.state.dissolved_CO2 = max(0, y[4])  # Dissolved CO2
-        self.state.T = y[5]  # Temperature
-        
-        # Update pH based on product concentration
-        if self.state.P > 0:
-            # Assume product is an organic acid (e.g., lactate)
-            self.state.pH = self.ph_calc.organic_acid_pH(
-                self.state.P,
-                'lactate',  # Can parameterize
-                self.buffer.concentration,
-                self.config.pH0
+        if mass_transfer_model is None:
+            # Default: dynamic kLa
+            self.mass_transfer = DynamicKLa(
+                k_O2=reactor_config.k_O2,
+                a=reactor_config.a,
+                b=reactor_config.b,
+                k_X=reactor_config.k_X
             )
-    
-    def derivatives(self, t: float, y: np.ndarray) -> np.ndarray:
-        """
-        Calculate derivatives for ODE solver.
-        
-        State vector y = [X, S, P, DO, DCO2, T]
-        
-        Args:
-            t: Current time (h)
-            y: State vector
-            
-        Returns:
-            Derivative vector dy/dt
-        """
-        # Unpack state
-        X = max(0, y[0])
-        S = max(0, y[1])
-        P = max(0, y[2])
-        DO = max(0, y[3])  # Dissolved O2 (mmol/L)
-        DCO2 = max(0, y[4])  # Dissolved CO2 (mmol/L)
-        T = y[5]
-        
-        # Calculate all kinetic rates
-        rates = calculate_all_rates(self.cell_params, S, X, P)
-        
-        mu = rates['mu']
-        dX_dt = rates['dX_dt']
-        dS_dt = rates['dS_dt']
-        dP_dt = rates['dP_dt']
-        OUR = rates['OUR']
-        CER = rates['CER']
-        
-        # =====================================================================
-        # SUBSTRATE DEPLETION SAFEGUARD
-        # =====================================================================
-        # The Pirt model calculates maintenance consumption (ms * X) regardless
-        # of substrate availability. When S → 0, this creates a non-physical
-        # situation where dS/dt remains negative, driving S below zero.
-        #
-        # This clamp prevents negative substrate by limiting consumption to
-        # what's actually available. However, this is a NUMERICAL SAFEGUARD,
-        # not a complete biological model of starvation.
-        #
-        # BIOLOGICAL REALITY (not modeled here):
-        # When substrate is exhausted and maintenance cannot be met, cells may:
-        #
-        # 1. ENDOGENOUS METABOLISM: Cells consume internal reserves (glycogen,
-        #    PHB, lipids, etc.) to meet maintenance. This would cause gradual
-        #    biomass decline: dX/dt = -k_end * X
-        #
-        # 2. CELL DEATH/LYSIS: Without energy, cells lose viability and lyse.
-        #    This releases intracellular contents, potentially enabling
-        #    "cryptic growth" of surviving cells on lysate.
-        #    Typical death rates: kd = 0.01-0.05 h⁻¹
-        #
-        # 3. DORMANCY: Some organisms enter a low-energy stationary state,
-        #    dramatically reducing maintenance requirements. Spore-formers
-        #    (Bacillus, Clostridium) are extreme examples.
-        #
-        # 4. MAINTENANCE ADAPTATION: Some evidence suggests ms itself decreases
-        #    during prolonged starvation as cells down-regulate metabolism.
-        #
-        # For accurate post-depletion dynamics, implement one of:
-        #   - Biomass decay term: dX/dt = μ*X - kd*X*(1 - S/(Ks_death + S))
-        #   - Endogenous metabolism: dX/dt = μ*X - k_end*X when S < threshold
-        #   - Viability model: track viable vs. non-viable cell fractions
-        #
-        # For now, we simply prevent negative substrate. Results after
-        # substrate depletion should be interpreted with caution.
-        # =====================================================================
-        
-        # Clamp: don't consume substrate faster than it can be depleted
-        # Use a small threshold to avoid numerical issues near zero
-        S_MIN_THRESHOLD = 1e-6  # g/L
-        if S < S_MIN_THRESHOLD:
-            # Substrate essentially gone - stop all consumption
-            dS_dt = 0.0
         else:
-            # Limit consumption rate so S doesn't go negative in one step
-            # Max rate = consume all S in ~0.01 hours (numerical buffer)
-            max_depletion_rate = S / 0.01
-            dS_dt = max(dS_dt, -max_depletion_rate)
+            self.mass_transfer = mass_transfer_model
         
-        # Gas transfer
-        # Assume inlet gas composition for partial pressures
-        P_O2 = self.config.inlet_gas.O2 * 1.0  # atm
-        P_CO2 = self.config.inlet_gas.CO2 * 1.0  # atm
+        self.heat_balance = HeatBalance(
+            thermo_props=ThermodynamicProperties(),
+            heat_config=HeatTransferConfig(
+                U=reactor_config.U,
+                D_tank=reactor_config.D_tank,
+                D_impeller=reactor_config.D_impeller,
+                N_p=5.0,
+                T_feed=feed_strategy.feed_composition.temperature
+            ),
+            temp_controller=temp_controller
+        )
         
-        OTR = self.gas_balance.oxygen_mass_transfer(DO, P_O2, T)
-        CTR = self.gas_balance.co2_mass_transfer(DCO2, P_CO2, T)
+        if pH_model is None:
+            self.pH_model = SimplifiedpHModel(
+                pH0=initial_state.pH,
+                k_acid=0.0  # Neutral product by default
+            )
+        else:
+            self.pH_model = pH_model
         
-        # Dissolved gas balances
-        dDO_dt = self.gas_balance.dissolved_oxygen_balance(OTR, OUR)
-        dDCO2_dt = self.gas_balance.dissolved_co2_balance(CTR, CER)
+        # Gas phase
+        self.inlet_gas = reactor_config.inlet_gas
+        self.P_total = 1.0  # atm
         
-        # Heat generation and removal
-        Q_gen = self.heat_gen.heat_from_our(OUR, self.state.V)
-        Q_removed = self.heat_balance.heat_removal(T, self.config.T_set, UA=100.0)
+        # Temperature control
+        self.T_jacket_fixed = reactor_config.T_setpoint
         
-        # Temperature change
-        dT_dt = self.heat_balance.temperature_change(Q_gen, Q_removed)
-        
-        # Assemble derivative vector
-        dydt = np.array([
-            dX_dt,      # Biomass
-            dS_dt,      # Substrate
-            dP_dt,      # Product
-            dDO_dt,     # Dissolved O2
-            dDCO2_dt,   # Dissolved CO2
-            dT_dt       # Temperature
-        ])
-        
-        # Store additional info for history
-        self._store_rates(t, mu, OUR, CER, Q_gen)
-        
-        return dydt
-    
-    def _store_rates(self, t: float, mu: float, OUR: float, 
-                    CER: float, Q_gen: float):
-        """Store calculated rates for history tracking."""
-        # This is called during ODE solving
-        # Store in temporary buffer and consolidate later
-        pass
+        # History of the last simulation (filled by FedBatchSimulator from
+        # the accepted solver steps)
+        self.history = {
+            'time': [],
+            'X': [], 'S_carbon': [], 'S_nitrogen': [], 'P': [],
+            'DO': [], 'DCO2': [], 'V': [], 'T': [], 'N': [],
+            'mu': [], 'OUR': [], 'CER': [], 'OTR': [], 'CTR': [],
+            'Q_gas': [], 'kLa': [], 'pH': [], 'T_jacket': [],
+            'F_feed': [], 'D': []
+        }
     
     def get_state_vector(self) -> np.ndarray:
         """Get current state as vector for ODE solver."""
         return np.array([
             self.state.X,
-            self.state.S,
+            self.state.S_carbon,
+            self.state.S_nitrogen,
             self.state.P,
-            self.state.dissolved_O2,
-            self.state.dissolved_CO2,
-            self.state.T
+            self.state.DO,
+            self.state.DCO2,
+            self.state.V,
+            self.state.T,
+            self.state.N,
+            self.state.I_DO,
+            self.state.I_T,
+            self.state.I_F
         ])
     
-    def record_state(self):
-        """Record current state to history."""
-        # Calculate current rates for recording
-        rates = calculate_all_rates(
-            self.cell_params, 
-            self.state.S, 
-            self.state.X, 
-            self.state.P
-        )
+    def update_state(self, t: float, y: np.ndarray):
+        """Update reactor state from ODE solution."""
+        self.state.time = t
+        self.state.X = y[0]
+        self.state.S_carbon = y[1]
+        self.state.S_nitrogen = y[2]
+        self.state.P = y[3]
+        self.state.DO = y[4]
+        self.state.DCO2 = y[5]
+        self.state.V = y[6]
+        self.state.T = y[7]
+        self.state.N = y[8]
+        self.state.I_DO = y[9]
+        self.state.I_T = y[10]
+        self.state.I_F = y[11]
         
-        Q_gen = self.heat_gen.heat_from_our(rates['OUR'], self.state.V)
-        
-        self.history['time'].append(self.state.time)
-        self.history['X'].append(self.state.X)
-        self.history['S'].append(self.state.S)
-        self.history['P'].append(self.state.P)
-        self.history['pH'].append(self.state.pH)
-        self.history['mu'].append(rates['mu'])
-        self.history['OUR'].append(rates['OUR'])
-        self.history['CER'].append(rates['CER'])
-        self.history['Q_gen'].append(Q_gen)
-        self.history['T'].append(self.state.T)
+        # Calculate pH
+        self.state.pH = self.pH_model.calculate_pH(max(0.0, self.state.P))
     
-    def get_history_arrays(self) -> Dict[str, np.ndarray]:
-        """Convert history to numpy arrays."""
-        return {key: np.array(val) for key, val in self.history.items()}
-    
-    def check_limits(self) -> Dict[str, bool]:
+    def _evaluate(self, t: float, y: np.ndarray):
         """
-        Check if reactor is within operational limits.
+        Evaluate the model at (t, y).
+        
+        Pure function: no state is stored or modified, so it can be called by
+        the solver during integration and again afterwards to recover the
+        algebraic outputs on the accepted solution.
         
         Returns:
-            Dictionary of limit checks
+            (dydt, outputs) where outputs is a dictionary of the algebraic
+            quantities (rates, controller actions, transfer rates).
         """
-        checks = {
-            'substrate_depleted': self.state.S < 0.01,
-            'biomass_low': self.state.X < 0.001,
-            'temperature_high': self.state.T > self.config.T_set + 5.0,
-            'temperature_low': self.state.T < self.config.T_set - 5.0,
-            'ph_low': self.state.pH < 4.0,
-            'ph_high': self.state.pH > 9.0,
-            'oxygen_limited': self.state.dissolved_O2 < 0.1  # mmol/L
+        # ========== 1. UNPACK STATE ==========
+        # Concentrations are floored at zero only to shield the rate laws
+        # from solver round-off (values of order -1e-12). The balances below
+        # cannot drive any of them negative: uptake, oxygen consumption and
+        # CO2 stripping all vanish as their concentration goes to zero.
+        X = max(0, y[0])
+        S_carbon = max(0, y[1])
+        S_nitrogen = max(0, y[2])
+        P = max(0, y[3])
+        DO = max(0, y[4])
+        DCO2 = max(0, y[5])
+        V = max(0.1, y[6])
+        T = y[7]
+        N = max(0, y[8])
+        I_DO, I_T, I_F = y[9], y[10], y[11]
+        
+        # Create current state object
+        current_state = ReactorState(
+            time=t, X=X, S_carbon=S_carbon, S_nitrogen=S_nitrogen,
+            P=P, DO=DO, DCO2=DCO2, V=V, T=T, N=N,
+            I_DO=I_DO, I_T=I_T, I_F=I_F
+        )
+        
+        # ========== 2. FEED RATE ==========
+        F_in = self.feed_strategy.get_feed_rate(t, current_state)
+        feed_comp = self.feed_strategy.get_composition(t)
+        dI_F_dt = self.feed_strategy.integral_derivative(t, current_state)
+        
+        # Dilution rate
+        D = F_in / V if V > 0 else 0.0
+        
+        # ========== 3. GROWTH KINETICS ==========
+        # Multiple substrate limitation
+        substrates = {
+            'carbon': S_carbon,
+            'nitrogen': S_nitrogen
         }
         
-        return checks
-    
-    def is_finished(self) -> bool:
-        """
-        Determine if batch is finished.
+        rates = self.kinetics.rates(substrates, DO, X)
+        mu = rates['mu']
         
-        Typical end conditions:
-        - Substrate depleted
-        - Growth stopped (mu ~ 0)
-        - Time limit reached
-        """
-        limits = self.check_limits()
+        # Net biomass growth (negative during starvation: endogenous decay)
+        dX_dt = rates['dX_dt']
         
-        # End if substrate depleted or biomass not growing
-        if limits['substrate_depleted']:
-            return True
+        # Substrate consumption rates (negative = consumption)
+        dS_carbon_rxn = rates['substrate_rates']['carbon']
+        dS_nitrogen_rxn = rates['substrate_rates'].get('nitrogen', 0.0)
         
-        # Calculate current growth rate
-        mu = self.kinetics.specific_growth_rate(self.state.S)
-        if mu < 0.001:  # Essentially stopped
-            return True
+        # Product formation
+        dP_dt_rxn = rates['dP_dt']
         
-        return False
-    
-    def get_summary(self) -> Dict:
-        """
-        Get summary of current reactor state.
+        # Oxygen uptake and CO2 evolution (electron and carbon balances)
+        OUR = rates['OUR']
+        CER = rates['CER']
         
-        Returns:
-            Dictionary with key metrics
-        """
-        rates = calculate_all_rates(
-            self.cell_params,
-            self.state.S,
-            self.state.X,
-            self.state.P
+        # ========== 4. DO CONTROL ==========
+        # Update state with current OUR for control
+        current_state.OUR = OUR
+        
+        control_result = self.do_control.calculate_operating_conditions(
+            DO=DO, OUR=OUR, state=current_state
         )
         
-        # Calculate yields
-        S_consumed = self.config.S0 - self.state.S
-        if S_consumed > 0:
-            Yx_s_actual = (self.state.X - self.config.X0) / S_consumed
-            Yp_s_actual = self.state.P / S_consumed
+        N_target = control_result['N']
+        Q_gas = control_result['Q_gas']
+        dI_DO_dt = control_result.get('dI_dt', 0.0)
+        
+        # Agitation dynamics (first-order lag, 10 second time constant)
+        tau_N = 10.0 / 3600.0  # Convert to hours
+        dN_dt = (N_target - N) / tau_N
+        
+        # ========== 5. GAS-LIQUID MASS TRANSFER ==========
+        # Gas phase conditions
+        gas_conditions = GasPhaseConditions(
+            inlet_composition=self.inlet_gas,
+            P_total=self.P_total,
+            Q_gas=Q_gas,
+            V_liquid=V,
+            T=T,
+            N=N,
+            X=X
+        )
+        
+        # Outlet gas composition (for average partial pressure)
+        outlet_gas = self.mass_transfer.outlet_gas_composition(
+            OUR, CER, gas_conditions
+        )
+        
+        # Average partial pressures
+        y_O2_avg = (self.inlet_gas.O2 + outlet_gas.O2) / 2
+        y_CO2_avg = (self.inlet_gas.CO2 + outlet_gas.CO2) / 2
+        
+        P_O2 = y_O2_avg * self.P_total
+        P_CO2 = y_CO2_avg * self.P_total
+        
+        # Mass transfer rates
+        kLa = self.mass_transfer.get_kLa_O2(gas_conditions)
+        OTR = self.mass_transfer.oxygen_transfer_rate(DO, P_O2, gas_conditions)
+        CTR = self.mass_transfer.co2_transfer_rate(DCO2, P_CO2, gas_conditions)
+        
+        # ========== 6. MASS BALANCES ==========
+        # Biomass (no feed)
+        dX_dt_total = dX_dt - D * X
+        
+        # Carbon substrate
+        dS_carbon_dt = D * (feed_comp.S_carbon - S_carbon) + dS_carbon_rxn
+        
+        # Nitrogen substrate
+        dS_nitrogen_dt = D * (feed_comp.S_nitrogen - S_nitrogen) + dS_nitrogen_rxn
+        
+        # Product (no feed)
+        dP_dt = dP_dt_rxn - D * P
+        
+        # Dissolved oxygen
+        dDO_dt = OTR - OUR - D * DO
+        
+        # Dissolved CO2
+        dDCO2_dt = CER - CTR - D * DCO2
+        
+        # Volume
+        dV_dt = F_in
+        
+        # ========== 7. HEAT BALANCE ==========
+        # Temperature control
+        if self.temp_controller is not None:
+            T_jacket = self.temp_controller.get_jacket_temperature(t, T, I_T)
+            dI_T_dt = self.temp_controller.integral_derivative(T, I_T)
         else:
-            Yx_s_actual = 0.0
-            Yp_s_actual = 0.0
+            T_jacket = self.T_jacket_fixed
+            dI_T_dt = 0.0
         
-        return {
-            'time': self.state.time,
-            'biomass': self.state.X,
-            'substrate': self.state.S,
-            'product': self.state.P,
-            'pH': self.state.pH,
-            'temperature': self.state.T,
-            'growth_rate': rates['mu'],
-            'OUR': rates['OUR'],
-            'CER': rates['CER'],
-            'Yx_s_actual': Yx_s_actual,
-            'Yp_s_actual': Yp_s_actual,
-            'Yx_s_theoretical': self.cell_params.Yx_s_max,
-            'substrate_consumed': S_consumed,
-            'biomass_formed': self.state.X - self.config.X0,
-            'product_formed': self.state.P
+        # Heat balance
+        dT_dt = self.heat_balance.temperature_derivative(
+            t=t, T=T, OUR=OUR, N=N, F_in=F_in, Q_gas=Q_gas,
+            V=V, T_jacket=T_jacket
+        )
+        
+        # ========== 8. ASSEMBLE DERIVATIVE VECTOR ==========
+        dydt = np.array([
+            dX_dt_total,      # Biomass
+            dS_carbon_dt,     # Carbon substrate
+            dS_nitrogen_dt,   # Nitrogen substrate
+            dP_dt,            # Product
+            dDO_dt,           # Dissolved O2
+            dDCO2_dt,         # Dissolved CO2
+            dV_dt,            # Volume
+            dT_dt,            # Temperature
+            dN_dt,            # Agitation speed
+            dI_DO_dt,         # DO controller integral
+            dI_T_dt,          # Temperature controller integral
+            dI_F_dt           # Feed controller integral
+        ])
+        
+        outputs = {
+            'mu': mu, 'OUR': OUR, 'CER': CER, 'OTR': OTR, 'CTR': CTR,
+            'Q_gas': Q_gas, 'kLa': kLa, 'pH': self.pH_model.calculate_pH(P),
+            'T_jacket': T_jacket, 'F_feed': F_in, 'D': D,
+            'N_target': N_target,
+            'oxygen_limited': bool(control_result.get('oxygen_limited', False)),
+            'state': current_state, 'control_result': control_result,
         }
-    
-    def print_summary(self):
-        """Print formatted summary of reactor state."""
-        summary = self.get_summary()
         
-        print("\n" + "="*60)
-        print(f"Batch Reactor Status - Time: {summary['time']:.2f} h")
-        print("="*60)
-        print(f"\nConcentrations:")
-        print(f"  Biomass (X):    {summary['biomass']:.3f} g/L")
-        print(f"  Substrate (S):  {summary['substrate']:.3f} g/L")
-        print(f"  Product (P):    {summary['product']:.3f} g/L")
-        
-        print(f"\nEnvironmental:")
-        print(f"  pH:             {summary['pH']:.2f}")
-        print(f"  Temperature:    {summary['temperature']:.1f} Â°C")
-        
-        print(f"\nKinetics:")
-        print(f"  Growth rate (Î¼): {summary['growth_rate']:.4f} 1/h")
-        print(f"  OUR:            {summary['OUR']:.2f} mmol/L/h")
-        print(f"  CER:            {summary['CER']:.2f} mmol/L/h")
-        
-        print(f"\nYields:")
-        print(f"  Yx/s (actual):   {summary['Yx_s_actual']:.3f} g/g")
-        print(f"  Yx/s (max):      {summary['Yx_s_theoretical']:.3f} g/g")
-        print(f"  Yp/s (actual):   {summary['Yp_s_actual']:.3f} g/g")
-        
-        print(f"\nCumulative:")
-        print(f"  Substrate used:  {summary['substrate_consumed']:.2f} g/L")
-        print(f"  Biomass formed:  {summary['biomass_formed']:.3f} g/L")
-        print(f"  Product formed:  {summary['product_formed']:.3f} g/L")
-        print("="*60 + "\n")
-
-
-def create_example_reactor() -> BatchReactor:
-    """
-    Create an example reactor with typical E. coli parameters.
+        return dydt, outputs
     
-    Returns:
-        Configured BatchReactor instance
-    """
-    # Typical E. coli parameters on glucose
-    cell_params = CellParameters(
-        mu_max=0.7,  # 1/h
-        Ks=0.1,  # g/L
-        Yx_s_max=0.5,  # g/g
-        Yp_s=0.0,  # No product initially
-        ms=0.03,  # g/g/h maintenance
-        production_model=ProductionModel.GROWTH_ASSOCIATED,
-        alpha=0.0,
-        beta=0.0,
-        RQ=1.0
-    )
+    def derivatives(self, t: float, y: np.ndarray) -> np.ndarray:
+        """
+        Calculate dy/dt for the fed-batch reactor.
+        
+        State vector:
+        y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
+        """
+        return self._evaluate(t, y)[0]
     
-    # Reactor configuration
-    config = ReactorConfig(
-        V_reactor=2.0,  # L
-        V_working=1.5,  # L
-        kLa_O2=100.0,  # 1/h
-        kLa_CO2=80.0,  # 1/h
-        T_set=37.0,  # Â°C
-        X0=0.1,  # g/L
-        S0=20.0,  # g/L
-        P0=0.0,  # g/L
-        pH0=7.0
-    )
+    def outputs(self, t: float, y: np.ndarray) -> Dict:
+        """Algebraic outputs (rates, controller actions) at (t, y)."""
+        return self._evaluate(t, y)[1]
     
-    reactor = BatchReactor(cell_params, config)
+    def termination_events(self):
+        """
+        Terminal events for the ODE solver.
+        
+        Each is a continuous function of the state that crosses zero at the
+        limit, so the solver can locate the crossing exactly.
+        
+        Returns:
+            List of (description, event_function) tuples
+        """
+        V_max = self.config.V_working_max
+        
+        def volume_limit(t, y):
+            return V_max - y[6]
+        
+        def temperature_low(t, y):
+            return y[7] - 10.0
+        
+        def temperature_high(t, y):
+            return 60.0 - y[7]
+        
+        events = [
+            (f"Volume limit reached ({V_max:.2f} L)", volume_limit),
+            ("Temperature below 10°C", temperature_low),
+            ("Temperature above 60°C", temperature_high),
+        ]
+        for _, fn in events:
+            fn.terminal = True
+            fn.direction = -1
+        return events
     
-    return reactor
+    def check_termination(self, t: float, y: np.ndarray) -> bool:
+        """Check if the state is outside the operating limits."""
+        return any(fn(t, y) <= 0 for _, fn in self.termination_events())

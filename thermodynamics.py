@@ -1,389 +1,381 @@
-# thermodynamics.py
 """
-Thermodynamic calculations for batch reactor.
-Heat generation from metabolism, heat of combustion, and energy balances.
+Thermodynamics and heat balance for fed-batch reactors.
+
+Implements:
+- Metabolic heat generation from OUR
+- Agitation heat from power input
+- Feed heat from temperature difference
+- Cooling via jacket
+- Temperature PID control
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Optional
+
+from .base_models import ThermodynamicProperties, HeatTransferConfig
 
 
-class MetabolicHeat:
+class TemperatureController:
     """
-    Calculate heat generation from microbial metabolism.
+    PI controller for reactor temperature via jacket temperature.
     
-    Heat is generated from:
-    1. Substrate oxidation
-    2. Biomass formation
-    3. Product formation
-    4. Maintenance energy
-    
-    Methods:
-    - Direct calorimetry (measure heat)
-    - Indirect calorimetry (from OUR and RQ)
-    - Stoichiometric calculations (heat of combustion)
+    The integral is carried in the ODE state vector (ReactorState.I_T) and
+    passed in, so the controller itself holds no memory and gives the same
+    answer however the solver orders its calls. Anti-windup is by
+    back-calculation.
     """
     
-    # Standard heats of combustion (kJ/g)
-    # These are -ΔH_c values (positive = exothermic)
-    HEAT_OF_COMBUSTION = {
-        'glucose': 15.6,  # kJ/g
-        'biomass': 20.0,  # kJ/g (typical for CH1.8O0.5N0.2)
-        'ethanol': 29.7,  # kJ/g
-        'acetate': 14.5,  # kJ/g
-        'lactate': 15.0,  # kJ/g
-        'glycerol': 18.0,  # kJ/g
-    }
-    
-    # Oxycaloric equivalents (kJ/mol O2)
-    # Heat released per mole of O2 consumed
-    OXYCALORIC_EQUIVALENT = {
-        'glucose': 468,  # kJ/mol O2 for complete oxidation
-        'carbohydrate': 468,  # kJ/mol O2
-        'lipid': 440,  # kJ/mol O2
-        'protein': 430,  # kJ/mol O2
-    }
-    
-    def __init__(self, substrate_type: str = 'glucose'):
+    def __init__(self, 
+                 T_setpoint: float,
+                 K_p: float,
+                 K_i: float = 0.0,
+                 K_d: float = 0.0,
+                 T_jacket_min: float = 4.0,
+                 T_jacket_max: float = 80.0):
         """
-        Initialize with substrate type.
+        Args:
+            T_setpoint: Target temperature (°C)
+            K_p: Proportional gain (°C jacket per °C error)
+            K_i: Integral gain (°C jacket per °C·h)
+            K_d: Derivative gain. Accepted for compatibility but not applied:
+                 derivative action on a noise-free simulated signal adds
+                 nothing and would make the equations implicit.
+            T_jacket_min: Minimum jacket temperature (°C)
+            T_jacket_max: Maximum jacket temperature (°C)
+        """
+        self.T_sp = T_setpoint
+        self.K_p = K_p
+        self.K_i = K_i
+        self.K_d = K_d
+        self.T_jacket_min = T_jacket_min
+        self.T_jacket_max = T_jacket_max
+    
+    def _unsaturated(self, T: float, integral: float) -> float:
+        error = T - self.T_sp
+        # Inverse action: higher T → lower T_jacket
+        return self.T_sp - (self.K_p * error + self.K_i * integral)
+    
+    def get_jacket_temperature(self, t: float, T: float, integral: float = 0.0) -> float:
+        """
+        Calculate required jacket temperature.
         
         Args:
-            substrate_type: Type of substrate for heat calculations
-        """
-        self.substrate_type = substrate_type
-        self.heat_combustion_substrate = self.HEAT_OF_COMBUSTION.get(substrate_type, 15.6)
-        self.oxycaloric_equiv = self.OXYCALORIC_EQUIVALENT.get(substrate_type, 468)
-    
-    def heat_from_our(self, OUR: float, V: float) -> float:
-        """
-        Calculate heat generation from oxygen uptake rate (indirect calorimetry).
+            t: Current time (h)
+            T: Current reactor temperature (°C)
+            integral: Integral of (T − T_setpoint) over time (°C·h)
         
-        Q = OUR * V * ΔH_ox
-        
-        Args:
-            OUR: Oxygen uptake rate (mmol O2/L/h)
-            V: Reactor volume (L)
-            
         Returns:
-            Heat generation rate (W = J/s)
+            T_jacket (°C)
         """
-        # Convert OUR from mmol/L/h to mol/h
-        OUR_mol_per_h = (OUR / 1000) * V
-        
-        # Heat generation (kJ/h)
-        Q_kJ_per_h = OUR_mol_per_h * self.oxycaloric_equiv
-        
-        # Convert to W (J/s)
-        Q_W = (Q_kJ_per_h * 1000) / 3600
-        
-        return Q_W
+        T_jacket = self._unsaturated(T, integral)
+        return max(self.T_jacket_min, min(T_jacket, self.T_jacket_max))
     
-    def heat_from_substrate(self, qs: float, X: float, V: float) -> float:
+    def integral_derivative(self, T: float, integral: float = 0.0) -> float:
         """
-        Calculate heat generation from substrate consumption.
+        Derivative of the integral state, with back-calculation anti-windup.
         
-        Q = qs * X * V * (-ΔH_c)
-        
-        This assumes all consumed substrate energy not going to biomass
-        is released as heat.
-        
-        Args:
-            qs: Specific substrate consumption rate (g substrate/g biomass/h)
-            X: Biomass concentration (g/L)
-            V: Reactor volume (L)
-            
         Returns:
-            Heat generation rate (W)
+            dI/dt (°C)
         """
-        # Substrate consumption rate (g/h)
-        dS_dt = qs * X * V
-        
-        # Heat generation (kJ/h)
-        Q_kJ_per_h = dS_dt * self.heat_combustion_substrate
-        
-        # Subtract energy that went into biomass
-        # This is approximate - assumes Yx_s accounts for energetics
-        # For more accurate: Q = (1 - Yx_s * ΔH_biomass/ΔH_substrate) * dS_dt * ΔH_substrate
-        
-        # Convert to W
-        Q_W = (Q_kJ_per_h * 1000) / 3600
-        
-        return Q_W
-    
-    def heat_from_growth(self, mu: float, X: float, V: float, 
-                        Yx_s: float, Yh_s: Optional[float] = None) -> float:
-        """
-        Calculate heat generation from growth (stoichiometric method).
-        
-        Q = (1 - Yh_s) * (1/Yx_s) * μ * X * V * ΔH_substrate
-        
-        where:
-            Yh_s = energy yield = heat generated / substrate consumed
-            Yx_s = biomass yield on substrate
-        
-        Args:
-            mu: Specific growth rate (1/h)
-            X: Biomass concentration (g/L)
-            V: Reactor volume (L)
-            Yx_s: Biomass yield on substrate
-            Yh_s: Energy yield (optional)
-            
-        Returns:
-            Heat generation rate (W)
-        """
-        # Growth rate (g/h)
-        dX_dt = mu * X * V
-        
-        # Substrate consumed for growth (g/h)
-        if Yx_s > 0:
-            dS_dt = dX_dt / Yx_s
-        else:
+        if self.K_i == 0.0:
             return 0.0
-        
-        # Heat generation
-        # Assume ~40% of substrate energy goes to biomass, 60% to heat
-        if Yh_s is None:
-            Yh_s = 0.6  # Typical value
-        
-        Q_kJ_per_h = Yh_s * dS_dt * self.heat_combustion_substrate
-        
-        # Convert to W
-        Q_W = (Q_kJ_per_h * 1000) / 3600
-        
-        return Q_W
-    
-    def maintenance_heat(self, ms: float, X: float, V: float) -> float:
-        """
-        Calculate heat from maintenance metabolism.
-        
-        Q = ms * X * V * ΔH_substrate
-        
-        Args:
-            ms: Maintenance coefficient (g substrate/g biomass/h)
-            X: Biomass concentration (g/L)
-            V: Reactor volume (L)
-            
-        Returns:
-            Heat generation rate (W)
-        """
-        # Maintenance substrate consumption (g/h)
-        dS_maint = ms * X * V
-        
-        # Heat from maintenance (all goes to heat)
-        Q_kJ_per_h = dS_maint * self.heat_combustion_substrate
-        
-        # Convert to W
-        Q_W = (Q_kJ_per_h * 1000) / 3600
-        
-        return Q_W
-    
-    def total_heat_generation(self, OUR: float, V: float, 
-                            mu: Optional[float] = None,
-                            X: Optional[float] = None,
-                            ms: Optional[float] = None,
-                            Yx_s: Optional[float] = None) -> float:
-        """
-        Calculate total heat generation rate.
-        
-        Primary method: Use OUR (most reliable)
-        Backup method: Sum growth + maintenance
-        
-        Args:
-            OUR: Oxygen uptake rate (mmol O2/L/h)
-            V: Reactor volume (L)
-            mu: Specific growth rate (1/h) - optional
-            X: Biomass concentration (g/L) - optional
-            ms: Maintenance coefficient - optional
-            Yx_s: Biomass yield - optional
-            
-        Returns:
-            Total heat generation rate (W)
-        """
-        # Primary: Use OUR
-        Q_our = self.heat_from_our(OUR, V)
-        
-        # Verify with growth + maintenance if data available
-        if all(x is not None for x in [mu, X, ms, Yx_s]):
-            Q_growth = self.heat_from_growth(mu, X, V, Yx_s)
-            Q_maint = self.maintenance_heat(ms, X, V)
-            Q_stoich = Q_growth + Q_maint
-            
-            # Use OUR-based as primary, but could compare for validation
-            return Q_our
-        
-        return Q_our
+        raw = self._unsaturated(T, integral)
+        sat = max(self.T_jacket_min, min(raw, self.T_jacket_max))
+        tau_t = abs(self.K_p / self.K_i) if self.K_p != 0.0 else 0.1
+        # raw falls as the integral grows, so a positive (raw − sat) must bleed it up
+        return (T - self.T_sp) + (raw - sat) / (self.K_i * tau_t)
 
 
 class HeatBalance:
-    """
-    Overall heat balance for the reactor.
+    """Complete heat balance for fed-batch reactor."""
     
-    Heat generated - Heat removed - Heat accumulated = 0
-    
-    dT/dt = (Q_gen - Q_removed) / (m * Cp)
-    
-    where:
-        Q_gen = metabolic heat generation
-        Q_removed = cooling (jacket, coils) + losses
-        m = total mass in reactor
-        Cp = specific heat capacity
-    """
-    
-    # Physical properties
-    CP_WATER = 4.18  # kJ/(kg·K) = kJ/(L·K) for water
-    RHO_WATER = 1.0  # kg/L
-    
-    def __init__(self, V_reactor: float, cooling_capacity: float = 1000.0):
+    def __init__(self,
+                 thermo_props: ThermodynamicProperties,
+                 heat_config: HeatTransferConfig,
+                 temp_controller: Optional[TemperatureController] = None):
         """
-        Initialize heat balance.
+        Args:
+            thermo_props: Thermodynamic properties
+            heat_config: Heat transfer configuration
+            temp_controller: Temperature controller, None for fixed jacket temp
+        """
+        self.props = thermo_props
+        self.config = heat_config
+        self.temp_controller = temp_controller
+    
+    def metabolic_heat(self, OUR: float, V: float) -> float:
+        """
+        Calculate metabolic heat generation from OUR.
+        
+        Q_metabolic = -ΔH_ox × OUR × V
         
         Args:
-            V_reactor: Reactor volume (L)
-            cooling_capacity: Maximum cooling capacity (W)
-        """
-        self.V_reactor = V_reactor
-        self.cooling_capacity = cooling_capacity
+            OUR: Oxygen uptake rate (mmol/L/h)
+            V: Reactor volume (L)
         
-        # Assume liquid properties similar to water
-        self.mass = V_reactor * self.RHO_WATER  # kg
-        self.Cp = self.CP_WATER  # kJ/(kg·K)
+        Returns:
+            Q_metabolic (W)
+        """
+        # Convert OUR to mol/h
+        OUR_mol_per_h = (OUR / 1000) * V
+        
+        # Heat generation (kJ/h)
+        # delta_H_ox is negative, so negate to get positive heat
+        Q_kJ_per_h = -self.props.delta_H_ox * OUR_mol_per_h
+        
+        # Convert to W (J/s)
+        Q_W = Q_kJ_per_h * 1000 / 3600
+        
+        return Q_W
     
-    def heat_removal(self, T: float, T_jacket: float, UA: float = 100.0) -> float:
+    def agitation_heat(self, N: float, V: float) -> float:
         """
-        Calculate heat removal rate.
+        Calculate heat from agitation.
         
-        Q_removed = UA * (T - T_jacket)
+        Args:
+            N: Agitation speed (rpm)
+            V: Reactor volume (L)
+        
+        Returns:
+            Q_agitation (W)
+        """
+        if self.config.D_impeller is not None:
+            # Full correlation: P = N_p × ρ × N³ × D⁵
+            N_per_s = N / 60.0  # rpm → 1/s
+            P = (self.config.N_p * self.props.rho * 
+                 (N_per_s ** 3) * (self.config.D_impeller ** 5))
+        else:
+            # Simplified correlation: P = k × N³ × V
+            k_power = 1e-9  # W·min³/rpm³/L
+            P = k_power * (N ** 3) * V
+        
+        return P
+    
+    def feed_heat(self, F_in: float, T: float) -> float:
+        """
+        Calculate heat from feed addition.
+        
+        Q_feed = F_in × ρ_feed × Cp_feed × (T_feed - T)
+        
+        Args:
+            F_in: Feed rate (L/h)
+            T: Reactor temperature (°C)
+        
+        Returns:
+            Q_feed (W), negative if feed is cooler than reactor
+        """
+        # Heat flow (kJ/h)
+        Q_kJ_per_h = (F_in * self.config.rho_feed * self.config.Cp_feed * 
+                      (self.config.T_feed - T))
+        
+        # Convert to W
+        Q_W = Q_kJ_per_h * 1000 / 3600
+        
+        return Q_W
+    
+    def cooling_heat(self, T: float, T_jacket: float, V: float) -> float:
+        """
+        Calculate heat removal via cooling jacket.
+        
+        Q_cooling = U × A × (T - T_jacket)
+        
+        For cylindrical reactor: A = 4V/D_tank
         
         Args:
             T: Reactor temperature (°C)
-            T_jacket: Cooling jacket temperature (°C)
-            UA: Overall heat transfer coefficient × area (W/K)
-            
+            T_jacket: Jacket temperature (°C)
+            V: Reactor volume (L)
+        
         Returns:
-            Heat removal rate (W)
+            Q_cooling (W), positive when removing heat
         """
-        Q_removed = UA * (T - T_jacket)
+        # Heat transfer area (m²)
+        V_m3 = V / 1000.0  # L → m³
+        A = 4 * V_m3 / self.config.D_tank  # m²
         
-        # Cannot remove more than cooling capacity
-        Q_removed = min(Q_removed, self.cooling_capacity)
+        # Heat transfer (W)
+        Q = self.config.U * A * (T - T_jacket)
         
-        return Q_removed
+        return Q
     
-    def temperature_change(self, Q_gen: float, Q_removed: float) -> float:
+    def evaporation_heat(self, Q_gas: float) -> float:
         """
-        Calculate rate of temperature change.
+        Calculate heat removed by evaporation.
         
-        dT/dt = (Q_gen - Q_removed) / (m * Cp)
+        Q_evaporation = λ_vap × F_evap × ρ_water
         
         Args:
-            Q_gen: Heat generation rate (W)
-            Q_removed: Heat removal rate (W)
-            
+            Q_gas: Gas flow rate (L/h)
+        
         Returns:
-            Rate of temperature change (°C/h)
+            Q_evaporation (W)
         """
-        # Convert W to kJ/h: W * 3.6
-        Q_net_kJ_per_h = (Q_gen - Q_removed) * 3.6
+        if self.config.k_evap == 0:
+            return 0.0
         
-        # Heat capacity (kJ/K)
-        total_Cp = self.mass * self.Cp
+        # Evaporation rate (L/h)
+        F_evap = self.config.k_evap * Q_gas * (1 - self.config.RH_inlet)
         
-        # Temperature change (K/h = °C/h)
-        dT_dt = Q_net_kJ_per_h / total_Cp
+        # Heat removal (kJ/h)
+        Q_kJ_per_h = self.props.lambda_vap * F_evap * 1.0  # ρ_water = 1 kg/L
+        
+        # Convert to W
+        Q_W = Q_kJ_per_h * 1000 / 3600
+        
+        return Q_W
+    
+    def temperature_derivative(self, 
+                              t: float,
+                              T: float,
+                              OUR: float,
+                              N: float,
+                              F_in: float,
+                              Q_gas: float,
+                              V: float,
+                              T_jacket: Optional[float] = None) -> float:
+        """
+        Calculate dT/dt from complete heat balance.
+        
+        dT/dt = Q_net / (ρ × V × Cp)
+        
+        Args:
+            t: Time (h)
+            T: Reactor temperature (°C)
+            OUR: Oxygen uptake rate (mmol/L/h)
+            N: Agitation speed (rpm)
+            F_in: Feed rate (L/h)
+            Q_gas: Gas flow rate (L/h)
+            V: Reactor volume (L)
+            T_jacket: Jacket temperature (°C), or None for controlled
+        
+        Returns:
+            dT/dt (°C/h)
+        """
+        # Heat generation
+        Q_metabolic = self.metabolic_heat(OUR, V)
+        Q_agitation = self.agitation_heat(N, V)
+        Q_feed = self.feed_heat(F_in, T)
+        
+        # Heat removal
+        if T_jacket is None and self.temp_controller is not None:
+            T_jacket = self.temp_controller.get_jacket_temperature(t, T)
+        elif T_jacket is None:
+            T_jacket = 25.0  # Default
+        
+        Q_cooling = self.cooling_heat(T, T_jacket, V)
+        Q_evaporation = self.evaporation_heat(Q_gas)
+        
+        # Net heat (W)
+        Q_net = Q_metabolic + Q_agitation + Q_feed - Q_cooling - Q_evaporation
+        
+        # Temperature change
+        # mass = ρ × V (kg), ρ in kg/m³, V in L
+        mass = self.props.rho * V / 1000.0  # kg
+        
+        # dT/dt = Q / (m × Cp)
+        # Q in W (J/s), Cp in kJ/kg/°C
+        dT_dt = Q_net / (mass * self.props.Cp * 1000)  # °C/s
+        dT_dt = dT_dt * 3600  # Convert to °C/h
         
         return dT_dt
-    
-    def required_cooling(self, Q_gen: float, T: float, T_set: float) -> float:
-        """
-        Calculate required cooling to maintain temperature.
-        
-        Args:
-            Q_gen: Heat generation rate (W)
-            T: Current temperature (°C)
-            T_set: Set point temperature (°C)
-            
-        Returns:
-            Required cooling rate (W)
-        """
-        # Simple proportional control
-        # Q_removed = Q_gen + K * (T - T_set)
-        K = 100.0  # Proportional gain (W/K)
-        
-        Q_required = Q_gen + K * (T - T_set)
-        
-        # Limit to cooling capacity
-        Q_required = min(Q_required, self.cooling_capacity)
-        Q_required = max(Q_required, 0.0)
-        
-        return Q_required
 
 
-class EnthalpyBalance:
-    """
-    Enthalpy balance for verification and advanced calculations.
+# Example usage and testing
+if __name__ == "__main__":
+    print("=" * 60)
+    print("THERMODYNAMICS VALIDATION")
+    print("=" * 60)
     
-    Useful for:
-    - Verifying energy conservation
-    - Calculating theoretical maximum yields
-    - Understanding energy distribution
-    """
+    # Create thermodynamic properties
+    thermo_props = ThermodynamicProperties(
+        rho=1000.0,
+        Cp=4.0,
+        delta_H_ox=-460.0,
+        lambda_vap=2400.0
+    )
     
-    def __init__(self, heat_combustion: Dict[str, float]):
-        """
-        Args:
-            heat_combustion: Dictionary of heats of combustion (kJ/g)
-                           for substrate, biomass, product
-        """
-        self.heat_combustion = heat_combustion
+    # Create heat transfer configuration
+    heat_config = HeatTransferConfig(
+        U=300.0,
+        D_tank=0.3,
+        D_impeller=0.05,
+        N_p=5.0,
+        T_feed=25.0,
+        rho_feed=1.2,
+        Cp_feed=3.8,
+        k_evap=0.0  # No evaporation (condenser)
+    )
     
-    def energy_balance(self, S_consumed: float, X_formed: float, 
-                      P_formed: float, Q_measured: float) -> float:
-        """
-        Check energy balance closure.
-        
-        ΔH_substrate = ΔH_biomass + ΔH_product + Q_heat
-        
-        Args:
-            S_consumed: Substrate consumed (g)
-            X_formed: Biomass formed (g)
-            P_formed: Product formed (g)
-            Q_measured: Measured heat generation (kJ)
-            
-        Returns:
-            Energy balance closure (kJ)
-        """
-        H_substrate = S_consumed * self.heat_combustion.get('substrate', 15.6)
-        H_biomass = X_formed * self.heat_combustion.get('biomass', 20.0)
-        H_product = P_formed * self.heat_combustion.get('product', 0.0)
-        
-        H_in = H_substrate
-        H_out = H_biomass + H_product + Q_measured
-        
-        return H_in - H_out
+    # Create temperature controller
+    temp_controller = TemperatureController(
+        T_setpoint=37.0,
+        K_p=10.0,
+        K_i=0.5,
+        T_jacket_min=4.0,
+        T_jacket_max=80.0
+    )
     
-    def theoretical_yield(self, substrate: str = 'glucose', 
-                         product: str = 'biomass') -> float:
-        """
-        Calculate theoretical maximum yield based on energetics.
-        
-        Args:
-            substrate: Substrate type
-            product: Product type
-            
-        Returns:
-            Theoretical maximum yield (g product / g substrate)
-        """
-        # Simplified: assumes all energy goes to product
-        # Real yields are lower due to entropy and inefficiencies
-        
-        H_substrate = self.heat_combustion.get(substrate, 15.6)
-        H_product = self.heat_combustion.get(product, 20.0)
-        
-        # Maximum yield if all energy conserved
-        Y_max = H_substrate / H_product
-        
-        # Apply thermodynamic efficiency (~60-70% typical)
-        Y_theoretical = Y_max * 0.65
-        
-        return Y_theoretical
+    # Create heat balance
+    heat_balance = HeatBalance(thermo_props, heat_config, temp_controller)
+    
+    # Test conditions
+    t = 10.0  # h
+    T = 37.5  # °C (slightly above setpoint)
+    OUR = 50.0  # mmol/L/h
+    N = 600  # rpm
+    F_in = 0.1  # L/h
+    Q_gas = 120  # L/h
+    V = 2.5  # L
+    
+    print(f"\nTest conditions:")
+    print(f"  Time: {t} h")
+    print(f"  Temperature: {T} °C")
+    print(f"  OUR: {OUR} mmol/L/h")
+    print(f"  Agitation: {N} rpm")
+    print(f"  Feed rate: {F_in} L/h")
+    print(f"  Gas flow: {Q_gas} L/h")
+    print(f"  Volume: {V} L")
+    
+    # Calculate individual heat terms
+    Q_metabolic = heat_balance.metabolic_heat(OUR, V)
+    Q_agitation = heat_balance.agitation_heat(N, V)
+    Q_feed = heat_balance.feed_heat(F_in, T)
+    
+    T_jacket = temp_controller.get_jacket_temperature(t, T)
+    Q_cooling = heat_balance.cooling_heat(T, T_jacket, V)
+    Q_evaporation = heat_balance.evaporation_heat(Q_gas)
+    
+    print(f"\nHeat generation:")
+    print(f"  Metabolic: {Q_metabolic:.2f} W")
+    print(f"  Agitation: {Q_agitation:.2f} W")
+    print(f"  Feed: {Q_feed:.2f} W")
+    print(f"  Total generation: {Q_metabolic + Q_agitation + Q_feed:.2f} W")
+    
+    print(f"\nHeat removal:")
+    print(f"  Jacket (T_jacket = {T_jacket:.1f}°C): {Q_cooling:.2f} W")
+    print(f"  Evaporation: {Q_evaporation:.2f} W")
+    print(f"  Total removal: {Q_cooling + Q_evaporation:.2f} W")
+    
+    # Calculate temperature derivative
+    dT_dt = heat_balance.temperature_derivative(t, T, OUR, N, F_in, Q_gas, V)
+    
+    print(f"\nNet heat balance:")
+    print(f"  Q_net: {Q_metabolic + Q_agitation + Q_feed - Q_cooling - Q_evaporation:.2f} W")
+    print(f"  dT/dt: {dT_dt:.4f} °C/h")
+    
+    # Test temperature controller response
+    print(f"\n" + "=" * 60)
+    print("TEMPERATURE CONTROLLER TEST")
+    print("=" * 60)
+    
+    test_temps = [36.0, 36.5, 37.0, 37.5, 38.0, 39.0]
+    
+    print(f"\nSetpoint: {temp_controller.T_sp}°C")
+    print(f"Controller: K_p={temp_controller.K_p}, K_i={temp_controller.K_i}")
+    
+    for T_test in test_temps:
+        T_j = temp_controller.get_jacket_temperature(t, T_test)
+        error = T_test - temp_controller.T_sp
+        print(f"  T = {T_test:.1f}°C (error = {error:+.1f}°C) → T_jacket = {T_j:.1f}°C")
+    
+    print("=" * 60)
