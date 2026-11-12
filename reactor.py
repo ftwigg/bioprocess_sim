@@ -198,22 +198,22 @@ class FedBatchReactor:
             'nitrogen': S_nitrogen
         }
         
-        mu = self.kinetics.specific_growth_rate(substrates, DO)
+        rates = self.kinetics.rates(substrates, DO, X)
+        mu = rates['mu']
         
-        # Biomass growth
-        dX_dt = self.kinetics.biomass_growth_rate(mu, X)
+        # Net biomass growth (negative during starvation: endogenous decay)
+        dX_dt = rates['dX_dt']
         
-        # Substrate consumption rates
-        substrate_rates = self.kinetics.substrate_consumption_rates(mu, X)
-        dS_carbon_rxn = substrate_rates['carbon']  # Negative (consumption)
-        dS_nitrogen_rxn = substrate_rates['nitrogen']
+        # Substrate consumption rates (negative = consumption)
+        dS_carbon_rxn = rates['substrate_rates']['carbon']
+        dS_nitrogen_rxn = rates['substrate_rates'].get('nitrogen', 0.0)
         
         # Product formation
-        dP_dt_rxn = self.kinetics.product_formation_rate(mu, X)
+        dP_dt_rxn = rates['dP_dt']
         
-        # Oxygen uptake and CO2 evolution
-        OUR = self.kinetics.oxygen_uptake_rate(mu, X)
-        CER = self.kinetics.co2_evolution_rate(OUR)
+        # Oxygen uptake and CO2 evolution (electron and carbon balances)
+        OUR = rates['OUR']
+        CER = rates['CER']
         
         # ========== 4. DO CASCADE CONTROL ==========
         # Update state with current OUR for control
