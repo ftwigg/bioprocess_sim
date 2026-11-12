@@ -59,8 +59,10 @@ A first-principles simulator for fed-batch fermentation processes built from eng
 
 ### Install dependencies
 ```bash
-pip install numpy scipy
+pip install numpy scipy matplotlib
 ```
+
+Matplotlib is only needed for `plotting.py` and the notebooks.
 
 ### Quick start
 ```python
@@ -71,6 +73,17 @@ from fedbatch_simulator.simulator import FedBatchSimulator
 
 # See examples/ for complete working examples
 ```
+
+## Notebooks
+
+Both run in Google Colab with no setup (the first cell clones this repository) and in a local Jupyter session started from a clone.
+
+| Notebook | What it covers | |
+|---|---|---|
+| `notebooks/fedbatch_simulator_colab.ipynb` | Quick start: one fed-batch run with plots, and experiments that are one call each | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/pid_sims_fixes/notebooks/fedbatch_simulator_colab.ipynb) |
+| `notebooks/fedbatch_simulator_examples.ipynb` | The three worked examples, glucose against glycerol, and an overfeeding run | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/pid_sims_fixes/notebooks/fedbatch_simulator_examples.ipynb) |
+
+The badges and the first cell of each notebook point at the `pid_sims_fixes` branch. After merging, change `pid_sims_fixes` to the new branch name in both places.
 
 ## State Vector
 
@@ -237,8 +250,11 @@ fedbatch_simulator/
 ├── chemistry.py             # pH models
 ├── reactor.py               # Main reactor class
 ├── simulator.py             # ODE integration
-└── examples/
-    └── exponential_fedbatch.py
+├── balances.py              # Carbon and electron closure checks
+├── plotting.py              # Result plots (needs matplotlib)
+├── examples/                # Three runnable scripts
+├── notebooks/               # Colab-ready notebooks
+└── tests/                   # Physical-sanity tests
 ```
 
 ## Predefined Configurations

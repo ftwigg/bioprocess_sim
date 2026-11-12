@@ -191,6 +191,8 @@ Run an example:
 python examples/exponential_fedbatch.py
 ```
 
+The same runs with plots are in `notebooks/fedbatch_simulator_examples.ipynb`.
+
 ## Common Patterns
 
 ### Batch → Fed-batch transition
@@ -294,6 +296,23 @@ feed_rate = results.F_feed
 # Summary
 print(results.get_summary())
 ```
+
+## Plotting Results
+
+```python
+import matplotlib.pyplot as plt
+from fedbatch_simulator.plotting import plot_fedbatch_results, plot_comparison
+
+# Twelve panels for one run
+plot_fedbatch_results(results, "My run", DO_setpoint=0.06, marks={'feed on': 5.5})
+
+# Up to three runs overlaid
+plot_comparison({'Run A': results_a, 'Run B': results_b})
+
+plt.show()
+```
+
+The notebooks in `notebooks/` do this for all three examples and open directly in Google Colab.
 
 ## Tips
 

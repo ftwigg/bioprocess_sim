@@ -352,6 +352,46 @@ def test_quickstart_minimal_example_runs():
     assert namespace['results'].X[-1] > 10.0
 
 
+def test_plots_build():
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from fedbatch_simulator.plotting import plot_fedbatch_results, plot_comparison
+    results, *_ = reference_run()
+    fig = plot_fedbatch_results(results, "test", DO_setpoint=DO_SP, marks={'feed on': 5.5})
+    assert len(fig.axes) == 12
+    fig2 = plot_comparison({'a': results, 'b': results})
+    assert len(fig2.axes) == 6
+    plt.close('all')
+
+
+def test_notebooks_run_top_to_bottom():
+    """Execute every code cell of both notebooks, in order, from this checkout."""
+    import json
+    import os
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    here = os.getcwd()
+    os.chdir(ROOT / 'notebooks')
+    try:
+        for name in ['fedbatch_simulator_colab.ipynb', 'fedbatch_simulator_examples.ipynb']:
+            notebook = json.loads((ROOT / 'notebooks' / name).read_text())
+            namespace = {}
+            with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+                warnings.simplefilter('ignore')   # plt.show() on a non-interactive backend
+                for cell in notebook['cells']:
+                    if cell['cell_type'] == 'code':
+                        assert not cell.get('outputs'), f"{name} was committed with outputs"
+                        exec(''.join(cell['source']), namespace)
+            plt.close('all')
+            for key, value in namespace.items():
+                if key.startswith('results') and hasattr(value, 'S_carbon'):
+                    assert_non_negative(value)
+    finally:
+        os.chdir(here)
+
+
 if __name__ == '__main__':
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith('test_') and callable(fn)]
