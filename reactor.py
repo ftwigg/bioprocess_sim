@@ -13,6 +13,7 @@ Integrates all subsystems:
 
 import numpy as np
 from typing import Optional, Dict
+from dataclasses import replace
 
 from .base_models import (
     ReactorConfiguration,
@@ -78,7 +79,8 @@ class FedBatchReactor:
         # Store configuration
         self.cell_params = cell_params
         self.config = reactor_config
-        self.state = initial_state
+        # Work on a copy so the caller's initial_state is left as given
+        self.state = replace(initial_state)
         self.feed_strategy = feed_strategy
         self.do_control = do_control
         self.temp_controller = temp_controller
@@ -124,7 +126,8 @@ class FedBatchReactor:
         # Temperature control
         self.T_jacket_fixed = reactor_config.T_setpoint
         
-        # History tracking
+        # History of the last simulation (filled by FedBatchSimulator from
+        # the accepted solver steps)
         self.history = {
             'time': [],
             'X': [], 'S_carbon': [], 'S_nitrogen': [], 'P': [],
@@ -353,60 +356,43 @@ class FedBatchReactor:
         State vector:
         y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
         """
-        dydt, out = self._evaluate(t, y)
-        
-        self._record_step(t, out['state'], out['mu'], out['OUR'], out['CER'],
-                          out['OTR'], out['CTR'], out['Q_gas'], out['T_jacket'],
-                          out, out['F_feed'], out['D'])
-        
-        return dydt
+        return self._evaluate(t, y)[0]
     
     def outputs(self, t: float, y: np.ndarray) -> Dict:
         """Algebraic outputs (rates, controller actions) at (t, y)."""
         return self._evaluate(t, y)[1]
     
-    def _record_step(self, t, state, mu, OUR, CER, OTR, CTR,
-                    Q_gas, T_jacket, control_result, F_in, D):
-        """Record current step to history."""
-        self.history['time'].append(t)
-        self.history['X'].append(state.X)
-        self.history['S_carbon'].append(state.S_carbon)
-        self.history['S_nitrogen'].append(state.S_nitrogen)
-        self.history['P'].append(state.P)
-        self.history['DO'].append(state.DO)
-        self.history['DCO2'].append(state.DCO2)
-        self.history['V'].append(state.V)
-        self.history['T'].append(state.T)
-        self.history['N'].append(state.N)
-        self.history['mu'].append(mu)
-        self.history['OUR'].append(OUR)
-        self.history['CER'].append(CER)
-        self.history['OTR'].append(OTR)
-        self.history['CTR'].append(CTR)
-        self.history['Q_gas'].append(Q_gas)
-        self.history['kLa'].append(control_result.get('kLa', 0))
-        self.history['pH'].append(self.pH_model.calculate_pH(state.P))
-        self.history['T_jacket'].append(T_jacket)
-        self.history['F_feed'].append(F_in)
-        self.history['D'].append(D)
+    def termination_events(self):
+        """
+        Terminal events for the ODE solver.
+        
+        Each is a continuous function of the state that crosses zero at the
+        limit, so the solver can locate the crossing exactly.
+        
+        Returns:
+            List of (description, event_function) tuples
+        """
+        V_max = self.config.V_working_max
+        
+        def volume_limit(t, y):
+            return V_max - y[6]
+        
+        def temperature_low(t, y):
+            return y[7] - 10.0
+        
+        def temperature_high(t, y):
+            return 60.0 - y[7]
+        
+        events = [
+            (f"Volume limit reached ({V_max:.2f} L)", volume_limit),
+            ("Temperature below 10°C", temperature_low),
+            ("Temperature above 60°C", temperature_high),
+        ]
+        for _, fn in events:
+            fn.terminal = True
+            fn.direction = -1
+        return events
     
     def check_termination(self, t: float, y: np.ndarray) -> bool:
-        """Check if simulation should terminate."""
-        X, S_c, S_n, P, DO, DCO2, V, T, N = y[:9]
-        
-        # Volume limit
-        if V >= self.config.V_working_max:
-            print(f"Termination at t={t:.2f}h: Volume limit reached ({V:.2f} L)")
-            return True
-        
-        # Substrate depletion
-        if S_c < 0.01 and S_n < 0.01:
-            print(f"Termination at t={t:.2f}h: Substrates depleted")
-            return True
-        
-        # Temperature out of range
-        if T < 10 or T > 60:
-            print(f"Termination at t={t:.2f}h: Temperature out of range ({T:.1f}°C)")
-            return True
-        
-        return False
+        """Check if the state is outside the operating limits."""
+        return any(fn(t, y) <= 0 for _, fn in self.termination_events())
