@@ -16,7 +16,14 @@ from .base_models import ThermodynamicProperties, HeatTransferConfig
 
 
 class TemperatureController:
-    """PID controller for reactor temperature via jacket temperature."""
+    """
+    PI controller for reactor temperature via jacket temperature.
+    
+    The integral is carried in the ODE state vector (ReactorState.I_T) and
+    passed in, so the controller itself holds no memory and gives the same
+    answer however the solver orders its calls. Anti-windup is by
+    back-calculation.
+    """
     
     def __init__(self, 
                  T_setpoint: float,
@@ -28,9 +35,11 @@ class TemperatureController:
         """
         Args:
             T_setpoint: Target temperature (°C)
-            K_p: Proportional gain
-            K_i: Integral gain
-            K_d: Derivative gain
+            K_p: Proportional gain (°C jacket per °C error)
+            K_i: Integral gain (°C jacket per °C·h)
+            K_d: Derivative gain. Accepted for compatibility but not applied:
+                 derivative action on a noise-free simulated signal adds
+                 nothing and would make the equations implicit.
             T_jacket_min: Minimum jacket temperature (°C)
             T_jacket_max: Maximum jacket temperature (°C)
         """
@@ -40,48 +49,41 @@ class TemperatureController:
         self.K_d = K_d
         self.T_jacket_min = T_jacket_min
         self.T_jacket_max = T_jacket_max
-        
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.prev_time = 0.0
     
-    def get_jacket_temperature(self, t: float, T: float) -> float:
+    def _unsaturated(self, T: float, integral: float) -> float:
+        error = T - self.T_sp
+        # Inverse action: higher T → lower T_jacket
+        return self.T_sp - (self.K_p * error + self.K_i * integral)
+    
+    def get_jacket_temperature(self, t: float, T: float, integral: float = 0.0) -> float:
         """
         Calculate required jacket temperature.
         
         Args:
             t: Current time (h)
             T: Current reactor temperature (°C)
+            integral: Integral of (T − T_setpoint) over time (°C·h)
         
         Returns:
             T_jacket (°C)
         """
-        error = T - self.T_sp
-        dt = t - self.prev_time if self.prev_time > 0 else 0.01
+        T_jacket = self._unsaturated(T, integral)
+        return max(self.T_jacket_min, min(T_jacket, self.T_jacket_max))
+    
+    def integral_derivative(self, T: float, integral: float = 0.0) -> float:
+        """
+        Derivative of the integral state, with back-calculation anti-windup.
         
-        # PID terms
-        P = self.K_p * error
-        self.integral += error * dt
-        I = self.K_i * self.integral
-        D = self.K_d * (error - self.prev_error) / dt if dt > 0 else 0.0
-        
-        # Control output
-        u = P + I + D
-        
-        # Jacket temperature (inverse action: higher T → lower T_jacket)
-        T_jacket = self.T_sp - u
-        
-        # Apply limits
-        T_jacket = max(self.T_jacket_min, min(T_jacket, self.T_jacket_max))
-        
-        # Anti-windup
-        if T_jacket == self.T_jacket_min or T_jacket == self.T_jacket_max:
-            self.integral -= error * dt
-        
-        self.prev_error = error
-        self.prev_time = t
-        
-        return T_jacket
+        Returns:
+            dI/dt (°C)
+        """
+        if self.K_i == 0.0:
+            return 0.0
+        raw = self._unsaturated(T, integral)
+        sat = max(self.T_jacket_min, min(raw, self.T_jacket_max))
+        tau_t = abs(self.K_p / self.K_i) if self.K_p != 0.0 else 0.1
+        # raw falls as the integral grows, so a positive (raw − sat) must bleed it up
+        return (T - self.T_sp) + (raw - sat) / (self.K_i * tau_t)
 
 
 class HeatBalance:

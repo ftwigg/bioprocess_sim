@@ -50,6 +50,16 @@ class FeedStrategy(ABC):
             Feed composition
         """
         return self.feed_composition
+    
+    def integral_derivative(self, t: float, state: ReactorState) -> float:
+        """
+        Derivative of the feed controller's integral state (ReactorState.I_F).
+        
+        Zero for open-loop strategies. Feedback strategies with integral
+        action override this; the integral lives in the ODE state vector so
+        the strategy itself holds no memory.
+        """
+        return 0.0
 
 
 class ConstantFeed(FeedStrategy):
@@ -100,15 +110,43 @@ class ExponentialFeed(FeedStrategy):
         F = self.F0 * np.exp(self.mu_set * t_elapsed)
         F = min(F, self.F_max)
         return F
+    
+    @staticmethod
+    def initial_rate(mu_set: float, X: float, V: float, S_feed: float,
+                     Y_xs: float, ms: float = 0.0) -> float:
+        """
+        Feed rate that supplies exactly what the biomass present needs to
+        grow at mu_set (Pirt): F0 = (mu_set/Y_xs + ms) × X × V / S_feed.
+        
+        Args:
+            mu_set: Target specific growth rate (1/h)
+            X: Biomass concentration when the feed starts (g/L)
+            V: Volume when the feed starts (L)
+            S_feed: Substrate concentration in the feed (g/L)
+            Y_xs: True biomass yield (g/g)
+            ms: Maintenance coefficient (g/g/h)
+        
+        Returns:
+            F0 (L/h)
+        """
+        return (mu_set / Y_xs + ms) * X * V / S_feed
 
 
 class DOStatFeed(FeedStrategy):
     """
-    DO-stat feed: Adjust feed rate to maintain DO setpoint.
+    DO-stat feed: adjust the feed rate to hold DO at a setpoint.
     
-    Uses PI control:
-    F = F_base + K_p × (DO - DO_setpoint) + K_i × integral(error)
+    PI control on the DO error:
+    F = F_base + K_p × (DO − DO_setpoint) + K_i × ∫(DO − DO_setpoint) dt
     
+    Feeding raises oxygen demand and lowers DO, so K_p and K_i must be
+    POSITIVE: DO above the setpoint means the culture can take more substrate
+    (feed more), DO below the setpoint means it is being overfed (feed less).
+    
+    Run it with agitation and aeration fixed (FixedAerationAgitation). If a
+    DO cascade is also active on the same setpoint the two controllers fight.
+    
+    The integral is carried in the ODE state vector (ReactorState.I_F).
     Set K_i = 0 for proportional-only control.
     """
     
@@ -118,15 +156,18 @@ class DOStatFeed(FeedStrategy):
                  K_p: float,
                  K_i: float = 0.0,
                  F_min: float = 0.0,
-                 F_max: float = 1.0):
+                 F_max: float = 1.0,
+                 F_base: float = None):
         """
         Args:
             feed_composition: Feed composition
             DO_setpoint: Target DO (mmol/L)
-            K_p: Proportional gain (L/h per mmol/L)
-            K_i: Integral gain (L/h per mmol/L per hour)
+            K_p: Proportional gain (L/h per mmol/L), positive
+            K_i: Integral gain (L/h per mmol/L per hour), positive
             F_min: Minimum feed rate (L/h)
             F_max: Maximum feed rate (L/h)
+            F_base: Feed rate at zero error and zero integral (L/h).
+                    Defaults to the midpoint of F_min and F_max.
         """
         super().__init__(feed_composition)
         self.DO_setpoint = DO_setpoint
@@ -134,41 +175,23 @@ class DOStatFeed(FeedStrategy):
         self.K_i = K_i
         self.F_min = F_min
         self.F_max = F_max
-        self.F_base = (F_min + F_max) / 2  # Start at midpoint
-        
-        # Integral state
-        self.integral = 0.0
-        self.last_t = None
-        self.last_error = 0.0
+        self.F_base = (F_min + F_max) / 2 if F_base is None else F_base
+    
+    def _unsaturated(self, state: ReactorState) -> float:
+        error = state.DO - self.DO_setpoint
+        return self.F_base + self.K_p * error + self.K_i * getattr(state, 'I_F', 0.0)
     
     def get_feed_rate(self, t: float, state: ReactorState) -> float:
-        # Calculate error
-        error = state.DO - self.DO_setpoint
-        
-        # Update integral (trapezoidal rule)
-        if self.last_t is not None and self.K_i != 0.0:
-            dt = t - self.last_t
-            if dt > 0:
-                # Trapezoidal integration
-                self.integral += 0.5 * (error + self.last_error) * dt
-                
-                # Anti-windup: Reset integral if saturated
-                F_test = self.F_base + self.K_p * error + self.K_i * self.integral
-                if F_test > self.F_max or F_test < self.F_min:
-                    # Don't accumulate integral when saturated
-                    self.integral -= 0.5 * (error + self.last_error) * dt
-        
-        # PI control
-        F = self.F_base + self.K_p * error + self.K_i * self.integral
-        
-        # Saturate
-        F = max(self.F_min, min(F, self.F_max))
-        
-        # Update state for next call
-        self.last_t = t
-        self.last_error = error
-        
-        return F
+        return max(self.F_min, min(self._unsaturated(state), self.F_max))
+    
+    def integral_derivative(self, t: float, state: ReactorState) -> float:
+        if self.K_i == 0.0:
+            return 0.0
+        raw = self._unsaturated(state)
+        sat = max(self.F_min, min(raw, self.F_max))
+        tau_t = abs(self.K_p / self.K_i) if self.K_p != 0.0 else 0.1
+        # Back-calculation anti-windup
+        return (state.DO - self.DO_setpoint) + (sat - raw) / (self.K_i * tau_t)
 
 
 class PiecewiseFeed(FeedStrategy):
@@ -193,29 +216,28 @@ class PiecewiseFeed(FeedStrategy):
         # Use composition from first strategy
         super().__init__(self.segments[0][1].feed_composition)
     
-    def get_feed_rate(self, t: float, state: ReactorState) -> float:
-        # Find active segment
+    def _active(self, t: float) -> FeedStrategy:
         active_strategy = self.segments[0][1]
-        
         for t_switch, strategy in self.segments:
             if t >= t_switch:
                 active_strategy = strategy
             else:
                 break
-        
-        return active_strategy.get_feed_rate(t, state)
+        return active_strategy
+    
+    @property
+    def switch_times(self) -> List[float]:
+        """Times at which the active strategy changes (h)."""
+        return [t_switch for t_switch, _ in self.segments]
+    
+    def get_feed_rate(self, t: float, state: ReactorState) -> float:
+        return self._active(t).get_feed_rate(t, state)
     
     def get_composition(self, t: float) -> FeedComposition:
-        # Find active segment
-        active_strategy = self.segments[0][1]
-        
-        for t_switch, strategy in self.segments:
-            if t >= t_switch:
-                active_strategy = strategy
-            else:
-                break
-        
-        return active_strategy.get_composition(t)
+        return self._active(t).get_composition(t)
+    
+    def integral_derivative(self, t: float, state: ReactorState) -> float:
+        return self._active(t).integral_derivative(t, state)
 
 
 # Example usage and testing
@@ -266,7 +288,7 @@ if __name__ == "__main__":
     do_stat_feed = DOStatFeed(
         feed_comp,
         DO_setpoint=0.06,
-        K_p=-1.0,  # Negative: higher DO → lower feed
+        K_p=1.0,  # Positive: higher DO → more feed
         F_min=0.0,
         F_max=0.5
     )

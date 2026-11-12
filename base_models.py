@@ -166,6 +166,13 @@ class ReactorState:
         N: Agitation speed (rpm)
         pH: pH value
         OUR: Oxygen uptake rate (mmol/L/h), calculated
+        I_DO: Integral state of the DO controller (h)
+        I_T: Integral state of the temperature controller (°C·h)
+        I_F: Integral state of the feed controller (mmol/L·h)
+    
+    The three integral states are part of the ODE state vector, so that
+    controllers hold no memory of their own and the model equations are a
+    pure function of (t, y).
     """
     time: float = 0.0
     X: float = 0.0
@@ -179,6 +186,9 @@ class ReactorState:
     N: float = 300.0
     pH: float = 7.0
     OUR: float = 0.0  # Calculated during simulation
+    I_DO: float = 0.0
+    I_T: float = 0.0
+    I_F: float = 0.0
 
 
 @dataclass

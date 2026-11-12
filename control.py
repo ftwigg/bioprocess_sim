@@ -2,9 +2,13 @@
 Control strategies for fed-batch operation.
 
 Implements:
-- DO cascade control (agitation → aeration)
-- Simplified algebraic cascade
+- PI DO cascade with real dynamics (agitation → aeration, split range)
+- Fixed agitation and aeration (DO left to the feed, or uncontrolled)
+- Idealised algebraic cascade (DO never leaves the setpoint)
 - Perfect DO control (OTR = OUR assumption)
+
+Controllers are stateless: any integral they need is carried in the ODE
+state vector (ReactorState.I_DO) and they return its derivative.
 """
 
 from abc import ABC, abstractmethod
@@ -25,14 +29,147 @@ class DOControlStrategy(ABC):
         Calculate N and Q_gas to maintain DO.
         
         Returns:
-            Dictionary with 'N', 'Q_gas', 'kLa', 'oxygen_limited'
+            Dictionary with 'N', 'Q_gas', 'kLa', 'oxygen_limited' and,
+            for controllers with integral action, 'dI_dt' (the derivative
+            of ReactorState.I_DO).
         """
         pass
 
 
+def _saturation_air(T: float) -> float:
+    """Oxygen saturation with air at 1 atm (mmol/L)."""
+    from .mass_transfer import HenryConstant
+    return HenryConstant.get_H_O2(T) * 0.21 * 1000.0
+
+
+class PICascade(DOControlStrategy):
+    """
+    PI DO cascade with split-range actuation: agitation first, then aeration.
+    
+    The controller output u (0-1) is
+    
+        u = K_c × (e + I/τ_i),   e = (DO_setpoint − DO) / DO_saturation
+    
+    and is mapped onto the actuators in sequence:
+    
+        0 ≤ u ≤ u_split : N from N_min to N_max, Q_gas at minimum
+        u_split < u ≤ 1 : N at N_max, Q_gas from minimum to maximum
+    
+    Unlike SimplifiedCascade this controller reacts with finite gain and
+    integral time, so DO overshoots when demand changes quickly: it spikes
+    when the substrate runs out and sags when a feed starts, and it crashes
+    once both actuators are saturated.
+    
+    The integral I is an ODE state (ReactorState.I_DO); anti-windup is by
+    back-calculation, which keeps the equations continuous for the solver.
+    """
+    
+    def __init__(self,
+                 DO_setpoint: float,
+                 N_min: float,
+                 N_max: float,
+                 Q_gas_min: float,
+                 Q_gas_max: float,
+                 kLa_correlation: DynamicKLa,
+                 K_c: float = 1.0,
+                 tau_i: float = 0.1,
+                 tau_t: float = None,
+                 u_split: float = 0.6):
+        """
+        Args:
+            DO_setpoint: Target DO (mmol/L)
+            N_min: Minimum agitation speed (rpm)
+            N_max: Maximum agitation speed (rpm)
+            Q_gas_min: Minimum gas flow rate (L/h)
+            Q_gas_max: Maximum gas flow rate (L/h)
+            kLa_correlation: Dynamic kLa model (used to report kLa)
+            K_c: Controller gain (output span per unit of DO saturation)
+            tau_i: Integral time (h); 0.1 h = 6 min
+            tau_t: Anti-windup tracking time (h), defaults to tau_i
+            u_split: Fraction of the output span assigned to agitation
+        """
+        self.DO_sp = DO_setpoint
+        self.N_min = N_min
+        self.N_max = N_max
+        self.Q_min = Q_gas_min
+        self.Q_max = Q_gas_max
+        self.kLa_model = kLa_correlation
+        self.K_c = K_c
+        self.tau_i = tau_i
+        self.tau_t = tau_i if tau_t is None else tau_t
+        self.u_split = u_split
+    
+    def calculate_operating_conditions(self, DO: float, OUR: float,
+                                       state: ReactorState) -> Dict:
+        """Calculate N, Q_gas and the integral derivative."""
+        C_sat = _saturation_air(state.T)
+        error = (self.DO_sp - DO) / C_sat          # positive when DO is low
+        
+        u_raw = self.K_c * (error + state.I_DO / self.tau_i)
+        u = max(0.0, min(u_raw, 1.0))
+        
+        if u <= self.u_split:
+            N = self.N_min + (self.N_max - self.N_min) * u / self.u_split
+            Q_gas = self.Q_min
+        else:
+            N = self.N_max
+            Q_gas = self.Q_min + (self.Q_max - self.Q_min) * (u - self.u_split) / (1.0 - self.u_split)
+        
+        # Back-calculation anti-windup: bleed the integral while saturated
+        dI_dt = error + (u - u_raw) * self.tau_i / (self.K_c * self.tau_t)
+        
+        vvm = Q_gas / state.V / 60.0
+        kLa = (self.kLa_model.k_O2 * (N ** self.kLa_model.a) * (vvm ** self.kLa_model.b)
+               * np.exp(-self.kLa_model.k_X * state.X))
+        
+        return {
+            'N': N,
+            'Q_gas': Q_gas,
+            'kLa': kLa,
+            'oxygen_limited': u >= 1.0,
+            'dI_dt': dI_dt,
+            'u': u,
+        }
+
+
+class FixedAerationAgitation(DOControlStrategy):
+    """
+    Agitation and aeration held at fixed values.
+    
+    Use this when DO is to be controlled by the feed alone (DO-stat), which
+    avoids two controllers fighting over the same measurement, or to see the
+    uncontrolled DO profile of a batch.
+    """
+    
+    def __init__(self, N: float, Q_gas: float, kLa_correlation: DynamicKLa = None):
+        """
+        Args:
+            N: Agitation speed (rpm)
+            Q_gas: Gas flow rate (L/h)
+            kLa_correlation: Dynamic kLa model (optional, used to report kLa)
+        """
+        self.N = N
+        self.Q_gas = Q_gas
+        self.kLa_model = kLa_correlation
+    
+    def calculate_operating_conditions(self, DO: float, OUR: float,
+                                       state: ReactorState) -> Dict:
+        kLa = None
+        if self.kLa_model is not None:
+            vvm = self.Q_gas / state.V / 60.0
+            kLa = (self.kLa_model.k_O2 * (self.N ** self.kLa_model.a) * (vvm ** self.kLa_model.b)
+                   * np.exp(-self.kLa_model.k_X * state.X))
+        return {'N': self.N, 'Q_gas': self.Q_gas, 'kLa': kLa, 'oxygen_limited': False}
+
+
 class SimplifiedCascade(DOControlStrategy):
     """
-    Simplified DO cascade control (algebraic).
+    Idealised DO cascade control (algebraic).
+    
+    This inverts the kLa correlation at every instant, so DO sits exactly on
+    the setpoint whenever the actuators are within range. It is useful as a
+    best-case reference, but it cannot show the DO spike at substrate
+    exhaustion or any other controller transient. Use PICascade for that.
     
     Control logic:
     1. Calculate required kLa to maintain DO setpoint

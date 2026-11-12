@@ -41,9 +41,17 @@ class FedBatchReactor:
     - Heat generation and temperature control
     - pH modeling (simplified)
     
-    State vector (9 ODEs):
-    y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N]
+    State vector (12 ODEs):
+    y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
+    
+    The last three are the integral states of the DO, temperature and feed
+    controllers. Keeping them in the state vector makes the right-hand side
+    a pure function of (t, y): the solver may evaluate it in any order, any
+    number of times, and get the same answer.
     """
+    
+    STATE_NAMES = ['X', 'S_carbon', 'S_nitrogen', 'P', 'DO', 'DCO2',
+                   'V', 'T', 'N', 'I_DO', 'I_T', 'I_F']
     
     def __init__(self,
                  cell_params: CellParameters,
@@ -137,37 +145,48 @@ class FedBatchReactor:
             self.state.DCO2,
             self.state.V,
             self.state.T,
-            self.state.N
+            self.state.N,
+            self.state.I_DO,
+            self.state.I_T,
+            self.state.I_F
         ])
     
     def update_state(self, t: float, y: np.ndarray):
         """Update reactor state from ODE solution."""
         self.state.time = t
-        self.state.X = max(0, y[0])
-        self.state.S_carbon = max(0, y[1])
-        self.state.S_nitrogen = max(0, y[2])
-        self.state.P = max(0, y[3])
-        self.state.DO = max(0, y[4])
-        self.state.DCO2 = max(0, y[5])
-        self.state.V = max(0, y[6])
+        self.state.X = y[0]
+        self.state.S_carbon = y[1]
+        self.state.S_nitrogen = y[2]
+        self.state.P = y[3]
+        self.state.DO = y[4]
+        self.state.DCO2 = y[5]
+        self.state.V = y[6]
         self.state.T = y[7]
-        self.state.N = max(0, y[8])
+        self.state.N = y[8]
+        self.state.I_DO = y[9]
+        self.state.I_T = y[10]
+        self.state.I_F = y[11]
         
         # Calculate pH
-        self.state.pH = self.pH_model.calculate_pH(self.state.P)
+        self.state.pH = self.pH_model.calculate_pH(max(0.0, self.state.P))
     
-    def derivatives(self, t: float, y: np.ndarray) -> np.ndarray:
+    def _evaluate(self, t: float, y: np.ndarray):
         """
-        Calculate dy/dt for the fed-batch reactor.
+        Evaluate the model at (t, y).
         
-        State vector:
-        y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N]
+        Pure function: no state is stored or modified, so it can be called by
+        the solver during integration and again afterwards to recover the
+        algebraic outputs on the accepted solution.
         
         Returns:
-        dydt = [dX/dt, dS_c/dt, dS_n/dt, dP/dt, dDO/dt, dDCO2/dt, dV/dt, dT/dt, dN/dt]
+            (dydt, outputs) where outputs is a dictionary of the algebraic
+            quantities (rates, controller actions, transfer rates).
         """
-        
         # ========== 1. UNPACK STATE ==========
+        # Concentrations are floored at zero only to shield the rate laws
+        # from solver round-off (values of order -1e-12). The balances below
+        # cannot drive any of them negative: uptake, oxygen consumption and
+        # CO2 stripping all vanish as their concentration goes to zero.
         X = max(0, y[0])
         S_carbon = max(0, y[1])
         S_nitrogen = max(0, y[2])
@@ -177,16 +196,19 @@ class FedBatchReactor:
         V = max(0.1, y[6])
         T = y[7]
         N = max(0, y[8])
+        I_DO, I_T, I_F = y[9], y[10], y[11]
         
         # Create current state object
         current_state = ReactorState(
             time=t, X=X, S_carbon=S_carbon, S_nitrogen=S_nitrogen,
-            P=P, DO=DO, DCO2=DCO2, V=V, T=T, N=N
+            P=P, DO=DO, DCO2=DCO2, V=V, T=T, N=N,
+            I_DO=I_DO, I_T=I_T, I_F=I_F
         )
         
         # ========== 2. FEED RATE ==========
         F_in = self.feed_strategy.get_feed_rate(t, current_state)
         feed_comp = self.feed_strategy.get_composition(t)
+        dI_F_dt = self.feed_strategy.integral_derivative(t, current_state)
         
         # Dilution rate
         D = F_in / V if V > 0 else 0.0
@@ -215,7 +237,7 @@ class FedBatchReactor:
         OUR = rates['OUR']
         CER = rates['CER']
         
-        # ========== 4. DO CASCADE CONTROL ==========
+        # ========== 4. DO CONTROL ==========
         # Update state with current OUR for control
         current_state.OUR = OUR
         
@@ -225,6 +247,7 @@ class FedBatchReactor:
         
         N_target = control_result['N']
         Q_gas = control_result['Q_gas']
+        dI_DO_dt = control_result.get('dI_dt', 0.0)
         
         # Agitation dynamics (first-order lag, 10 second time constant)
         tau_N = 10.0 / 3600.0  # Convert to hours
@@ -250,10 +273,12 @@ class FedBatchReactor:
         # Average partial pressures
         y_O2_avg = (self.inlet_gas.O2 + outlet_gas.O2) / 2
         y_CO2_avg = (self.inlet_gas.CO2 + outlet_gas.CO2) / 2
+        
         P_O2 = y_O2_avg * self.P_total
         P_CO2 = y_CO2_avg * self.P_total
         
         # Mass transfer rates
+        kLa = self.mass_transfer.get_kLa_O2(gas_conditions)
         OTR = self.mass_transfer.oxygen_transfer_rate(DO, P_O2, gas_conditions)
         CTR = self.mass_transfer.co2_transfer_rate(DCO2, P_CO2, gas_conditions)
         
@@ -282,9 +307,11 @@ class FedBatchReactor:
         # ========== 7. HEAT BALANCE ==========
         # Temperature control
         if self.temp_controller is not None:
-            T_jacket = self.temp_controller.get_jacket_temperature(t, T)
+            T_jacket = self.temp_controller.get_jacket_temperature(t, T, I_T)
+            dI_T_dt = self.temp_controller.integral_derivative(T, I_T)
         else:
             T_jacket = self.T_jacket_fixed
+            dI_T_dt = 0.0
         
         # Heat balance
         dT_dt = self.heat_balance.temperature_derivative(
@@ -292,11 +319,7 @@ class FedBatchReactor:
             V=V, T_jacket=T_jacket
         )
         
-        # ========== 8. RECORD STEP ==========
-        self._record_step(t, current_state, mu, OUR, CER, OTR, CTR,
-                         Q_gas, T_jacket, control_result, F_in, D)
-        
-        # ========== 9. ASSEMBLE DERIVATIVE VECTOR ==========
+        # ========== 8. ASSEMBLE DERIVATIVE VECTOR ==========
         dydt = np.array([
             dX_dt_total,      # Biomass
             dS_carbon_dt,     # Carbon substrate
@@ -306,10 +329,41 @@ class FedBatchReactor:
             dDCO2_dt,         # Dissolved CO2
             dV_dt,            # Volume
             dT_dt,            # Temperature
-            dN_dt             # Agitation speed
+            dN_dt,            # Agitation speed
+            dI_DO_dt,         # DO controller integral
+            dI_T_dt,          # Temperature controller integral
+            dI_F_dt           # Feed controller integral
         ])
         
+        outputs = {
+            'mu': mu, 'OUR': OUR, 'CER': CER, 'OTR': OTR, 'CTR': CTR,
+            'Q_gas': Q_gas, 'kLa': kLa, 'pH': self.pH_model.calculate_pH(P),
+            'T_jacket': T_jacket, 'F_feed': F_in, 'D': D,
+            'N_target': N_target,
+            'oxygen_limited': bool(control_result.get('oxygen_limited', False)),
+            'state': current_state, 'control_result': control_result,
+        }
+        
+        return dydt, outputs
+    
+    def derivatives(self, t: float, y: np.ndarray) -> np.ndarray:
+        """
+        Calculate dy/dt for the fed-batch reactor.
+        
+        State vector:
+        y = [X, S_carbon, S_nitrogen, P, DO, DCO2, V, T, N, I_DO, I_T, I_F]
+        """
+        dydt, out = self._evaluate(t, y)
+        
+        self._record_step(t, out['state'], out['mu'], out['OUR'], out['CER'],
+                          out['OTR'], out['CTR'], out['Q_gas'], out['T_jacket'],
+                          out, out['F_feed'], out['D'])
+        
         return dydt
+    
+    def outputs(self, t: float, y: np.ndarray) -> Dict:
+        """Algebraic outputs (rates, controller actions) at (t, y)."""
+        return self._evaluate(t, y)[1]
     
     def _record_step(self, t, state, mu, OUR, CER, OTR, CTR,
                     Q_gas, T_jacket, control_result, F_in, D):
@@ -338,7 +392,7 @@ class FedBatchReactor:
     
     def check_termination(self, t: float, y: np.ndarray) -> bool:
         """Check if simulation should terminate."""
-        X, S_c, S_n, P, DO, DCO2, V, T, N = y
+        X, S_c, S_n, P, DO, DCO2, V, T, N = y[:9]
         
         # Volume limit
         if V >= self.config.V_working_max:
