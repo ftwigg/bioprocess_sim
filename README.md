@@ -80,10 +80,10 @@ Both run in Google Colab with no setup (the first cell clones this repository) a
 
 | Notebook | What it covers | |
 |---|---|---|
-| `notebooks/fedbatch_simulator_colab.ipynb` | Quick start: one fed-batch run with plots, and experiments that are one call each | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/pid_sims_fixes/notebooks/fedbatch_simulator_colab.ipynb) |
-| `notebooks/fedbatch_simulator_examples.ipynb` | The three worked examples, glucose against glycerol, and an overfeeding run | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/pid_sims_fixes/notebooks/fedbatch_simulator_examples.ipynb) |
+| `notebooks/fedbatch_simulator_colab.ipynb` | Quick start: one fed-batch run with plots, and experiments that are one call each | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/main/notebooks/fedbatch_simulator_colab.ipynb) |
+| `notebooks/fedbatch_simulator_examples.ipynb` | The three worked examples, glucose against glycerol, and an overfeeding run | [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ftwigg/bioprocess_sim/blob/main/notebooks/fedbatch_simulator_examples.ipynb) |
 
-The badges and the first cell of each notebook point at the `pid_sims_fixes` branch. After merging, change `pid_sims_fixes` to the new branch name in both places.
+The badges and the first cell of each notebook point at the `main` branch. To run a notebook against another branch in Colab, change `BRANCH` in its first cell.
 
 ## State Vector
 
